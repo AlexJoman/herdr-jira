@@ -47,7 +47,10 @@ pub enum Resp {
         name: String,
         result: Result<(), String>,
     },
-    Me(Result<JiraUser, String>),
+    Me {
+        gen: u64,
+        result: Result<JiraUser, String>,
+    },
     AssignableUsers {
         seq: u64,
         result: Result<Vec<JiraUser>, String>,
@@ -103,6 +106,8 @@ pub struct App {
 
     /// The authenticated user, fetched on first use of the assignee picker.
     pub me: Option<JiraUser>,
+    /// Bumped whenever a new client is installed; stale `Me` responses are dropped.
+    pub client_gen: u64,
     pub assign_for: String,
     pub assign_query: String,
     pub assign_users: Vec<JiraUser>,
@@ -173,6 +178,7 @@ impl App {
             transitions_for: String::new(),
             transitions_loading: false,
             me: None,
+            client_gen: 0,
             assign_for: String::new(),
             assign_query: String::new(),
             assign_users: vec![],
@@ -199,9 +205,7 @@ impl App {
             Ok(cfg) => match JiraClient::new(&cfg) {
                 Ok(client) => {
                     self.cfg = cfg;
-                    self.client = Some(Arc::new(client));
-                    self.me = None;
-                    self.assign_seq += 1;
+                    self.set_client(client);
                     self.fatal = None;
                     self.filter_idx = self.filter_idx.min(self.cfg.filters.len().saturating_sub(1));
                     self.load_filter(self.filter_idx);
@@ -213,6 +217,14 @@ impl App {
             },
             Err(e) => self.fatal = Some(e),
         }
+    }
+
+    /// Install a client and forget everything learned through the previous one.
+    fn set_client(&mut self, client: JiraClient) {
+        self.client = Some(Arc::new(client));
+        self.client_gen += 1;
+        self.me = None;
+        self.assign_seq += 1;
     }
 
     /// Rows currently on screen: top-level issues, with the children of every
@@ -311,9 +323,13 @@ impl App {
         }
         // Who "me" is — and whether this is Cloud — is needed before searching.
         self.assign_loading = true;
+        let gen = self.client_gen;
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(Resp::Me(client.myself()));
+            let _ = tx.send(Resp::Me {
+                gen,
+                result: client.myself(),
+            });
         });
     }
 
@@ -680,7 +696,8 @@ impl App {
                 }
                 Err(e) => self.toast(format!("{key}: {e}"), true),
             },
-            Resp::Me(result) => match result {
+            Resp::Me { gen, .. } if gen != self.client_gen => {}
+            Resp::Me { result, .. } => match result {
                 Ok(me) => {
                     self.me = Some(me);
                     if self.view == View::AssigneePicker {
@@ -1290,7 +1307,7 @@ mod tests {
             "[jira]\nbase_url = \"http://127.0.0.1:9\"\nauth = \"bearer\"\napi_token = \"t\"\n",
         )
         .unwrap();
-        app.client = Some(Arc::new(JiraClient::new(&app.cfg).unwrap()));
+        app.set_client(JiraClient::new(&app.cfg).unwrap());
         app.issues = vec![test_issue()];
         (app, rx)
     }
@@ -1392,34 +1409,39 @@ mod tests {
     }
 
     #[test]
-    fn reloading_config_forgets_current_user_and_pending_search() {
-        let dir = std::env::temp_dir().join(format!("herdr-jira-reload-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("config.toml"),
-            "[jira]\nbase_url = \"http://127.0.0.1:9\"\nauth = \"bearer\"\napi_token = \"t\"\n",
-        )
-        .unwrap();
-        std::env::set_var("HERDR_PLUGIN_CONFIG_DIR", &dir);
-
+    fn new_client_forgets_current_user_and_pending_lookups() {
         let (mut app, _rx) = assign_app();
-        app.me = Some(user("old", "Old"));
-        let seq = app.assign_seq;
-        app.reload_config();
-        let _ = std::fs::remove_dir_all(&dir);
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Esc);
+        let (gen, seq) = (app.client_gen, app.assign_seq);
 
-        assert!(app.fatal.is_none());
+        app.set_client(JiraClient::new(&app.cfg).unwrap());
         assert!(app.me.is_none(), "new client must re-fetch /myself");
         assert_ne!(app.assign_seq, seq, "old searches are stale");
+
+        app.on_resp(Resp::Me {
+            gen,
+            result: Ok(user("old", "Old")),
+        });
+        assert!(app.me.is_none(), "late /myself from the old client is dropped");
+
         press(&mut app, KeyCode::Char('a'));
         assert!(app.assign_loading, "fetches the current user again");
+        app.on_resp(Resp::Me {
+            gen: app.client_gen,
+            result: Ok(user("new", "New")),
+        });
+        assert_eq!(app.me, Some(user("new", "New")));
     }
 
     #[test]
     fn failing_to_identify_current_user_closes_picker() {
         let (mut app, _rx) = assign_app();
         press(&mut app, KeyCode::Char('a'));
-        app.on_resp(Resp::Me(Err("HTTP 401: unauthorized".into())));
+        app.on_resp(Resp::Me {
+            gen: app.client_gen,
+            result: Err("HTTP 401: unauthorized".into()),
+        });
         assert_eq!(app.view, View::List);
         assert!(!app.assign_loading);
         assert!(app.toast.as_ref().unwrap().1);
