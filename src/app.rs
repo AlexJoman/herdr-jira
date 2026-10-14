@@ -200,6 +200,8 @@ impl App {
                 Ok(client) => {
                     self.cfg = cfg;
                     self.client = Some(Arc::new(client));
+                    self.me = None;
+                    self.assign_seq += 1;
                     self.fatal = None;
                     self.filter_idx = self.filter_idx.min(self.cfg.filters.len().saturating_sub(1));
                     self.load_filter(self.filter_idx);
@@ -1387,6 +1389,30 @@ mod tests {
             (msg.as_str(), is_error),
             ("PROJ-7: assign: HTTP 403: no permission", true)
         );
+    }
+
+    #[test]
+    fn reloading_config_forgets_current_user_and_pending_search() {
+        let dir = std::env::temp_dir().join(format!("herdr-jira-reload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            "[jira]\nbase_url = \"http://127.0.0.1:9\"\nauth = \"bearer\"\napi_token = \"t\"\n",
+        )
+        .unwrap();
+        std::env::set_var("HERDR_PLUGIN_CONFIG_DIR", &dir);
+
+        let (mut app, _rx) = assign_app();
+        app.me = Some(user("old", "Old"));
+        let seq = app.assign_seq;
+        app.reload_config();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(app.fatal.is_none());
+        assert!(app.me.is_none(), "new client must re-fetch /myself");
+        assert_ne!(app.assign_seq, seq, "old searches are stale");
+        press(&mut app, KeyCode::Char('a'));
+        assert!(app.assign_loading, "fetches the current user again");
     }
 
     #[test]
