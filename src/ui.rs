@@ -30,6 +30,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     match app.view {
         View::FilterPicker => draw_filter_picker(f, app),
         View::TransitionPicker => draw_transition_picker(f, app),
+        View::AssigneePicker => draw_assignee_picker(f, app),
         View::AgentPicker => draw_agent_picker(f, app),
         View::NewAgentTypePicker => draw_new_agent_type_picker(f, app),
         View::NewAgentWorkspacePicker => draw_new_agent_workspace_picker(f, app),
@@ -205,9 +206,12 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         }
     }
     let hints = match app.view {
-        View::Detail => "Esc back  ·  j/k scroll  ·  s status  ·  d delegate  ·  o browser  ·  z zoom",
+        View::Detail => "Esc back  ·  j/k scroll  ·  s status  ·  a assignee  ·  d delegate  ·  o browser  ·  z zoom",
         View::SearchInput => "Enter search  ·  Esc cancel",
         View::JqlInput => "Enter run JQL  ·  Ctrl-U clear  ·  Esc cancel",
+        View::AssigneePicker => {
+            "type to search  ·  ↑/↓ move  ·  Enter assign  ·  Ctrl-U clear  ·  Esc cancel"
+        }
         View::NewAgentCwdInput => "Enter start  ·  Ctrl-U clear  ·  Esc back",
         View::AgentPicker => {
             "1-9 pick  ·  n new agent  ·  j/k move  ·  Enter select  ·  Esc cancel"
@@ -220,7 +224,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         View::FilterPicker | View::TransitionPicker => {
             "1-9 quick pick  ·  j/k move  ·  Enter select  ·  Esc cancel"
         }
-        _ => "Enter open  ·  →/← epic  ·  f filters  ·  / search  ·  s status  ·  d delegate  ·  z zoom  ·  r refresh  ·  ? help  ·  q quit",
+        _ => "Enter open  ·  →/← epic  ·  f filters  ·  / search  ·  s status  ·  a assignee  ·  d delegate  ·  z zoom  ·  r refresh  ·  ? help  ·  q quit",
     };
     f.render_widget(
         Paragraph::new(hints).style(Style::new().fg(Color::DarkGray)),
@@ -307,6 +311,52 @@ fn draw_transition_picker(f: &mut Frame, app: &App) {
         })
         .collect();
     render_picker_list(f, inner, items, app.picker_sel);
+}
+
+fn draw_assignee_picker(f: &mut Frame, app: &App) {
+    let title = format!("assign {}", app.assign_for);
+    // Search line + fixed rows + users, capped so long lists scroll.
+    let h = (app.assignee_picker_len() as u16 + 3).clamp(5, 18);
+    let inner = popup(f, &title, 60, h);
+    let [input, list] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
+    let status = if app.assign_loading { "  ⟳" } else { "" };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("search: ", Style::new().fg(Color::DarkGray)),
+            Span::raw(app.assign_query.clone()),
+            Span::styled("▏", Style::new().fg(ACCENT)),
+            Span::styled(status, Style::new().fg(Color::Yellow)),
+        ])),
+        input,
+    );
+    let me = app
+        .me
+        .as_ref()
+        .map(|m| m.display_name.clone())
+        .unwrap_or_else(|| "…".into());
+    let mut items: Vec<ListItem> = vec![
+        ListItem::new(Line::from(vec![
+            Span::styled(
+                "→ assign to me",
+                Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  ({me})"), Style::new().fg(Color::DarkGray)),
+        ])),
+        ListItem::new(Line::from(Span::styled(
+            "∅ unassign",
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ))),
+    ];
+    items.extend(app.assign_users.iter().map(|u| {
+        ListItem::new(Line::from(vec![
+            Span::styled(
+                format!("{:<24}", truncate_label(&u.display_name, 24)),
+                Style::new().fg(Color::Magenta),
+            ),
+            Span::styled(u.email.clone(), Style::new().fg(Color::DarkGray)),
+        ]))
+    }));
+    render_picker_list(f, list, items, app.picker_sel);
 }
 
 fn draw_agent_picker(f: &mut Frame, app: &App) {
@@ -564,7 +614,7 @@ fn draw_jql(f: &mut Frame, app: &App) {
 }
 
 fn draw_help(f: &mut Frame) {
-    let inner = popup(f, "help", 60, 20);
+    let inner = popup(f, "help", 60, 21);
     let rows = [
         ("j/k ↑/↓", "move / scroll"),
         ("Enter", "open issue details"),
@@ -574,6 +624,7 @@ fn draw_help(f: &mut Frame) {
         ("J", "run custom JQL (prefilled with current)"),
         ("1-9", "quick pick in any popup"),
         ("s", "change issue status"),
+        ("a", "assign: to me, unassign, or search users"),
         ("d", "delegate issue to an agent"),
         ("n", "in delegate picker: start a new agent"),
         ("o", "open issue in browser"),

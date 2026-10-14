@@ -3,7 +3,7 @@
 
 use crate::config::{Config, SpawnAgent};
 use crate::herdr::{self, HerdrAgent, HerdrWorkspace, StartAgentOpts};
-use crate::jira::{Issue, JiraClient, Transition};
+use crate::jira::{Issue, JiraClient, JiraUser, Transition};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -17,6 +17,8 @@ pub enum View {
     Detail,
     FilterPicker,
     TransitionPicker,
+    /// Search-as-you-type assignee picker (assign to me / unassign / users).
+    AssigneePicker,
     AgentPicker,
     /// Pick which agent binary to spawn (from `[delegate].agents`).
     NewAgentTypePicker,
@@ -43,6 +45,17 @@ pub enum Resp {
     Transitioned {
         key: String,
         name: String,
+        result: Result<(), String>,
+    },
+    Me(Result<JiraUser, String>),
+    AssignableUsers {
+        seq: u64,
+        result: Result<Vec<JiraUser>, String>,
+    },
+    Assigned {
+        key: String,
+        /// New assignee display name; `None` = unassigned.
+        name: Option<String>,
         result: Result<(), String>,
     },
     Agents(Result<Vec<HerdrAgent>, String>),
@@ -88,6 +101,15 @@ pub struct App {
     pub transitions_for: String,
     pub transitions_loading: bool,
 
+    /// The authenticated user, fetched on first use of the assignee picker.
+    pub me: Option<JiraUser>,
+    pub assign_for: String,
+    pub assign_query: String,
+    pub assign_users: Vec<JiraUser>,
+    pub assign_loading: bool,
+    /// Bumped per user search; stale responses are dropped.
+    pub assign_seq: u64,
+
     pub agents: Vec<HerdrAgent>,
     pub agents_loading: bool,
 
@@ -111,7 +133,14 @@ pub struct App {
 
 impl App {
     pub fn new(tx: Sender<Resp>) -> Self {
-        let mut app = Self {
+        let mut app = Self::blank(tx);
+        app.reload_config();
+        app
+    }
+
+    /// App with an empty config and no client; `new` then loads the config.
+    fn blank(tx: Sender<Resp>) -> Self {
+        Self {
             cfg: Config {
                 jira: crate::config::JiraConfig {
                     base_url: String::new(),
@@ -143,6 +172,12 @@ impl App {
             transitions: vec![],
             transitions_for: String::new(),
             transitions_loading: false,
+            me: None,
+            assign_for: String::new(),
+            assign_query: String::new(),
+            assign_users: vec![],
+            assign_loading: false,
+            assign_seq: 0,
             agents: vec![],
             agents_loading: false,
             pending_spawn: None,
@@ -156,9 +191,7 @@ impl App {
             last_jql: String::new(),
             detail_scroll: 0,
             toast: None,
-        };
-        app.reload_config();
-        app
+        }
     }
 
     pub fn reload_config(&mut self) {
@@ -256,6 +289,104 @@ impl App {
             let result = client.apply_transition(&key, &t.id);
             let _ = tx.send(Resp::Transitioned { key, name: t.to_status, result });
         });
+    }
+
+    fn open_assignee_picker(&mut self) {
+        let Some(issue) = self.selected_issue() else {
+            return;
+        };
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        self.assign_for = issue.key.clone();
+        self.assign_query.clear();
+        self.assign_users.clear();
+        self.picker_sel = 0;
+        self.view = View::AssigneePicker;
+        if self.me.is_some() {
+            self.search_assignees();
+            return;
+        }
+        // Who "me" is — and whether this is Cloud — is needed before searching.
+        self.assign_loading = true;
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(Resp::Me(client.myself()));
+        });
+    }
+
+    fn search_assignees(&mut self) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let Some(cloud) = self.me.as_ref().map(|m| m.cloud) else {
+            return;
+        };
+        self.assign_seq += 1;
+        self.assign_loading = true;
+        let seq = self.assign_seq;
+        let key = self.assign_for.clone();
+        let query = self.assign_query.trim().to_string();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = client.assignable_users(&key, &query, cloud);
+            let _ = tx.send(Resp::AssignableUsers { seq, result });
+        });
+    }
+
+    /// Rows in the assignee picker: "assign to me", "unassign", then users.
+    pub const ASSIGN_FIXED_ROWS: usize = 2;
+
+    pub fn assignee_picker_len(&self) -> usize {
+        Self::ASSIGN_FIXED_ROWS + self.assign_users.len()
+    }
+
+    fn pick_assignee_row(&mut self, row: usize) {
+        let Some(me) = self.me.clone() else {
+            self.toast("still identifying the current user…", true);
+            return;
+        };
+        let target = match row {
+            0 => Some(me),
+            1 => None,
+            _ => match self.assign_users.get(row - Self::ASSIGN_FIXED_ROWS) {
+                Some(u) => Some(u.clone()),
+                None => return,
+            },
+        };
+        self.view = View::List;
+        self.apply_assignee(target);
+    }
+
+    fn apply_assignee(&mut self, user: Option<JiraUser>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let Some(cloud) = self.me.as_ref().map(|m| m.cloud) else {
+            return;
+        };
+        let key = self.assign_for.clone();
+        let name = user.as_ref().map(|u| u.display_name.clone());
+        let tx = self.tx.clone();
+        match &name {
+            Some(n) => self.toast(format!("{key}: assigning to {n}…"), false),
+            None => self.toast(format!("{key}: unassigning…"), false),
+        }
+        std::thread::spawn(move || {
+            let result = client.assign(&key, user.as_ref(), cloud);
+            let _ = tx.send(Resp::Assigned { key, name, result });
+        });
+    }
+
+    /// Reflect a new assignee on every loaded copy of the issue.
+    fn set_local_assignee(&mut self, key: &str, name: &str) {
+        let all = self
+            .issues
+            .iter_mut()
+            .chain(self.children.values_mut().flatten());
+        for issue in all.filter(|i| i.key == key) {
+            issue.assignee = name.to_string();
+        }
     }
 
     /// Expand the selected epic (fetching its children on first open).
@@ -547,6 +678,65 @@ impl App {
                 }
                 Err(e) => self.toast(format!("{key}: {e}"), true),
             },
+            Resp::Me(result) => match result {
+                Ok(me) => {
+                    self.me = Some(me);
+                    if self.view == View::AssigneePicker {
+                        self.search_assignees();
+                    } else {
+                        self.assign_loading = false;
+                    }
+                }
+                Err(e) => {
+                    self.assign_loading = false;
+                    if self.view == View::AssigneePicker {
+                        self.view = View::List;
+                    }
+                    self.toast(format!("current user: {e}"), true);
+                }
+            },
+            Resp::AssignableUsers { seq, result } => {
+                if seq != self.assign_seq {
+                    return;
+                }
+                self.assign_loading = false;
+                if self.view != View::AssigneePicker {
+                    return;
+                }
+                match result {
+                    Ok(users) => {
+                        self.assign_users = users;
+                        // While searching, land on the first match.
+                        self.picker_sel = if self.assign_query.trim().is_empty()
+                            || self.assign_users.is_empty()
+                        {
+                            self.picker_sel.min(self.assignee_picker_len() - 1)
+                        } else {
+                            Self::ASSIGN_FIXED_ROWS
+                        };
+                    }
+                    Err(e) => {
+                        self.assign_users.clear();
+                        self.picker_sel = self.picker_sel.min(Self::ASSIGN_FIXED_ROWS - 1);
+                        self.toast(format!("{}: assignable users: {e}", self.assign_for), true);
+                    }
+                }
+            }
+            Resp::Assigned { key, name, result } => match result {
+                Ok(()) => {
+                    match &name {
+                        Some(n) => self.toast(format!("{key} → assigned to {n}"), false),
+                        None => self.toast(format!("{key} → unassigned"), false),
+                    }
+                    self.set_local_assignee(&key, name.as_deref().unwrap_or("—"));
+                    // Re-run the current query so the list reflects the change
+                    // (e.g. an unassigned issue leaving "My open issues").
+                    if !self.last_jql.is_empty() {
+                        self.spawn_search(self.last_jql.clone(), self.current_title.clone());
+                    }
+                }
+                Err(e) => self.toast(format!("{key}: assign: {e}"), true),
+            },
             Resp::Agents(result) => {
                 self.agents_loading = false;
                 match result {
@@ -641,6 +831,7 @@ impl App {
             View::Detail => self.keys_detail(key),
             View::FilterPicker => self.keys_filter_picker(key),
             View::TransitionPicker => self.keys_transition_picker(key),
+            View::AssigneePicker => self.keys_assignee_picker(key),
             View::AgentPicker => self.keys_agent_picker(key),
             View::NewAgentTypePicker => self.keys_new_agent_type(key),
             View::NewAgentWorkspacePicker => self.keys_new_agent_workspace(key),
@@ -709,6 +900,7 @@ impl App {
                 self.toast("config reloaded", false);
             }
             KeyCode::Char('s') => self.request_transitions(),
+            KeyCode::Char('a') => self.open_assignee_picker(),
             KeyCode::Char('d') => self.request_agents(),
             KeyCode::Char('o') => self.open_in_browser(),
             KeyCode::Char('z') => self.zoom_toggle(),
@@ -730,6 +922,7 @@ impl App {
             KeyCode::PageUp => self.detail_scroll = self.detail_scroll.saturating_sub(15),
             KeyCode::Char('g') => self.detail_scroll = 0,
             KeyCode::Char('s') => self.request_transitions(),
+            KeyCode::Char('a') => self.open_assignee_picker(),
             KeyCode::Char('d') => self.request_agents(),
             KeyCode::Char('o') => self.open_in_browser(),
             KeyCode::Char('z') => self.zoom_toggle(),
@@ -791,6 +984,36 @@ impl App {
                     self.view = View::List;
                     self.apply_transition(t);
                 }
+            }
+            _ => {}
+        }
+    }
+
+    /// Typing edits the search query (so no j/k or number hotkeys here);
+    /// arrows move, Enter applies.
+    fn keys_assignee_picker(&mut self, key: KeyEvent) {
+        let len = self.assignee_picker_len();
+        match key.code {
+            KeyCode::Esc => self.view = View::List,
+            KeyCode::Down => self.picker_sel = Self::move_sel(len, self.picker_sel, 1),
+            KeyCode::Up => self.picker_sel = Self::move_sel(len, self.picker_sel, -1),
+            KeyCode::PageDown => self.picker_sel = Self::move_sel(len, self.picker_sel, 10),
+            KeyCode::PageUp => self.picker_sel = Self::move_sel(len, self.picker_sel, -10),
+            KeyCode::Enter => self.pick_assignee_row(self.picker_sel),
+            KeyCode::Backspace => {
+                if self.assign_query.pop().is_some() {
+                    self.search_assignees();
+                }
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if !self.assign_query.is_empty() {
+                    self.assign_query.clear();
+                    self.search_assignees();
+                }
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.assign_query.push(c);
+                self.search_assignees();
             }
             _ => {}
         }
@@ -1054,6 +1277,126 @@ mod tests {
         let mut issue = test_issue();
         issue.description = "  ".into();
         assert_eq!(build_prompt(&cfg, &issue), "(no description)");
+    }
+
+    /// App with one issue and a client aimed at a closed local port, so the
+    /// background requests the picker fires fail fast without touching Jira.
+    fn assign_app() -> (App, std::sync::mpsc::Receiver<Resp>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::blank(tx);
+        app.cfg = toml::from_str(
+            "[jira]\nbase_url = \"http://127.0.0.1:9\"\nauth = \"bearer\"\napi_token = \"t\"\n",
+        )
+        .unwrap();
+        app.client = Some(Arc::new(JiraClient::new(&app.cfg).unwrap()));
+        app.issues = vec![test_issue()];
+        (app, rx)
+    }
+
+    fn user(id: &str, name: &str) -> JiraUser {
+        JiraUser {
+            id: id.into(),
+            display_name: name.into(),
+            email: String::new(),
+            cloud: true,
+        }
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn a_opens_assignee_picker_for_selected_issue() {
+        let (mut app, _rx) = assign_app();
+        app.assign_query = "old".into();
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.view, View::AssigneePicker);
+        assert_eq!(app.assign_for, "PROJ-7");
+        assert!(app.assign_query.is_empty());
+        assert!(app.assign_loading, "fetches the current user first");
+    }
+
+    #[test]
+    fn typing_in_assignee_picker_searches_and_drops_stale_results() {
+        let (mut app, _rx) = assign_app();
+        app.me = Some(user("me", "Me"));
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(
+            app.view,
+            View::AssigneePicker,
+            "j is text here, not navigation"
+        );
+        assert_eq!(app.assign_query, "jo");
+        let seq = app.assign_seq;
+
+        app.on_resp(Resp::AssignableUsers {
+            seq: seq - 1,
+            result: Ok(vec![user("x", "Stale")]),
+        });
+        assert!(app.assign_users.is_empty());
+
+        app.on_resp(Resp::AssignableUsers {
+            seq,
+            result: Ok(vec![user("jo", "Jo")]),
+        });
+        assert_eq!(app.assign_users, vec![user("jo", "Jo")]);
+        assert_eq!(
+            app.picker_sel,
+            App::ASSIGN_FIXED_ROWS,
+            "lands on first match"
+        );
+
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(app.assign_query, "j");
+        assert_eq!(app.assign_seq, seq + 1);
+    }
+
+    #[test]
+    fn unassign_updates_issue_after_success() {
+        let (mut app, _rx) = assign_app();
+        app.me = Some(user("me", "Me"));
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.view, View::List);
+
+        app.on_resp(Resp::Assigned {
+            key: "PROJ-7".into(),
+            name: None,
+            result: Ok(()),
+        });
+        assert_eq!(app.issues[0].assignee, "—");
+        let (msg, is_error, _) = app.toast.clone().unwrap();
+        assert_eq!((msg.as_str(), is_error), ("PROJ-7 → unassigned", false));
+    }
+
+    #[test]
+    fn assign_errors_are_toasted_and_keep_assignee() {
+        let (mut app, _rx) = assign_app();
+        app.on_resp(Resp::Assigned {
+            key: "PROJ-7".into(),
+            name: Some("Me".into()),
+            result: Err("HTTP 403: no permission".into()),
+        });
+        assert_eq!(app.issues[0].assignee, "Vitalii");
+        let (msg, is_error, _) = app.toast.clone().unwrap();
+        assert_eq!(
+            (msg.as_str(), is_error),
+            ("PROJ-7: assign: HTTP 403: no permission", true)
+        );
+    }
+
+    #[test]
+    fn failing_to_identify_current_user_closes_picker() {
+        let (mut app, _rx) = assign_app();
+        press(&mut app, KeyCode::Char('a'));
+        app.on_resp(Resp::Me(Err("HTTP 401: unauthorized".into())));
+        assert_eq!(app.view, View::List);
+        assert!(!app.assign_loading);
+        assert!(app.toast.as_ref().unwrap().1);
     }
 }
 
