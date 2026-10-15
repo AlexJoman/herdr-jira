@@ -352,9 +352,10 @@ fn paginate(
             }
         };
         raw.retain(|i| seen.insert(i["key"].as_str().unwrap_or_default().to_string()));
+        let fresh = raw.len();
         raw.truncate(limit - delivered);
         delivered += raw.len();
-        let capped = delivered >= limit && (got > raw.len() || next.is_some());
+        let capped = delivered >= limit && (fresh > raw.len() || next.is_some());
         let last = next.is_none() || delivered >= limit;
         if !on_page(raw, total, last, capped) || last {
             return Ok(());
@@ -652,6 +653,19 @@ mod tests {
         assert_eq!(cursors.len(), 3);
         let keys: Vec<String> = pages.into_iter().flat_map(|p| p.0).collect();
         assert_eq!(keys, vec!["P-0", "P-1", "P-2", "P-3"]);
+    }
+
+    #[test]
+    fn paginate_dropped_duplicates_do_not_count_as_capped() {
+        let (_, pages) = run_pages(
+            3,
+            vec![
+                serde_json::json!({ "startAt": 0, "total": 4, "issues": raw_issues(0..2) }),
+                serde_json::json!({ "startAt": 2, "total": 4, "issues": raw_issues(1..3) }),
+            ],
+            usize::MAX,
+        );
+        assert_eq!(pages[1], (vec!["P-2".into()], Some(4), true, false));
     }
 
     #[test]
