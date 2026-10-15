@@ -5,7 +5,8 @@ use crate::config::{Config, SpawnAgent};
 use crate::herdr::{self, HerdrAgent, HerdrWorkspace, StartAgentOpts};
 use crate::jira::{Issue, JiraClient, JiraUser, Transition};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use std::collections::{HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
@@ -19,6 +20,8 @@ pub enum View {
     TransitionPicker,
     /// Search-as-you-type assignee picker (assign to me / unassign / users).
     AssigneePicker,
+    /// Multi-select of statuses to hide from the issue list.
+    StatusFilterPicker,
     AgentPicker,
     /// Pick which agent binary to spawn (from `[delegate].agents`).
     NewAgentTypePicker,
@@ -51,6 +54,11 @@ pub enum Resp {
         gen: u64,
         result: Result<JiraUser, String>,
     },
+    /// Priority names in Jira's order, highest first.
+    Priorities {
+        gen: u64,
+        result: Result<Vec<String>, String>,
+    },
     AssignableUsers {
         seq: u64,
         result: Result<Vec<JiraUser>, String>,
@@ -78,6 +86,110 @@ pub fn is_epic(issue: &Issue) -> bool {
     issue.issue_type.eq_ignore_ascii_case("epic")
 }
 
+/// Issue-list columns, in display order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Column {
+    Key,
+    Type,
+    Status,
+    Priority,
+    Assignee,
+    Updated,
+    Summary,
+}
+
+impl Column {
+    pub const ALL: [Column; 7] = [
+        Column::Key,
+        Column::Type,
+        Column::Status,
+        Column::Priority,
+        Column::Assignee,
+        Column::Updated,
+        Column::Summary,
+    ];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Column::Key => "KEY",
+            Column::Type => "TYPE",
+            Column::Status => "STATUS",
+            Column::Priority => "PRIORITY",
+            Column::Assignee => "ASSIGNEE",
+            Column::Updated => "UPDATED",
+            Column::Summary => "SUMMARY",
+        }
+    }
+}
+
+/// Active list sort: column and direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sort {
+    pub column: Column,
+    pub ascending: bool,
+}
+
+/// Sort key for a priority name: the instance's own rank (names it did not
+/// return rank after it, alphabetically); `None` for no priority.
+fn priority_key(order: &[String], name: &str) -> Option<(usize, String)> {
+    if name.is_empty() || name == "—" {
+        return None;
+    }
+    let rank = order
+        .iter()
+        .position(|p| p.eq_ignore_ascii_case(name))
+        .unwrap_or(order.len());
+    Some((rank, name.to_lowercase()))
+}
+
+fn status_category_rank(category: &str) -> u8 {
+    match category {
+        "new" => 0,
+        "indeterminate" => 1,
+        "done" => 2,
+        _ => 3,
+    }
+}
+
+/// `PROJ-12` → ("PROJ", 12) so keys sort numerically within a project.
+fn key_parts(key: &str) -> (&str, u64) {
+    match key.rsplit_once('-') {
+        Some((project, num)) => (project, num.parse().unwrap_or(0)),
+        None => (key, 0),
+    }
+}
+
+/// Compare two issues on `sort`. Issues without a priority stay last
+/// in either direction.
+fn compare_issues(a: &Issue, b: &Issue, sort: Sort, priorities: &[String]) -> Ordering {
+    let ord = match sort.column {
+        Column::Priority => {
+            match (
+                priority_key(priorities, &a.priority),
+                priority_key(priorities, &b.priority),
+            ) {
+                (Some(x), Some(y)) => x.cmp(&y),
+                (Some(_), None) => return Ordering::Less,
+                (None, Some(_)) => return Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            }
+        }
+        Column::Key => key_parts(&a.key).cmp(&key_parts(&b.key)),
+        Column::Type => a.issue_type.to_lowercase().cmp(&b.issue_type.to_lowercase()),
+        Column::Status => status_category_rank(&a.status_category)
+            .cmp(&status_category_rank(&b.status_category))
+            .then_with(|| a.status.to_lowercase().cmp(&b.status.to_lowercase())),
+        Column::Assignee => a.assignee.to_lowercase().cmp(&b.assignee.to_lowercase()),
+        Column::Updated => a.updated.cmp(&b.updated),
+        Column::Summary => a.summary.to_lowercase().cmp(&b.summary.to_lowercase()),
+    };
+    if sort.ascending {
+        ord
+    } else {
+        ord.reverse()
+    }
+}
+
 pub struct App {
     pub cfg: Config,
     pub client: Option<Arc<JiraClient>>,
@@ -99,6 +211,17 @@ pub struct App {
 
     pub filter_idx: usize,
     pub picker_sel: usize, // shared selection index for popup pickers
+
+    /// Column under the header cursor (index into `Column::ALL`).
+    pub sort_col: usize,
+    /// Active sort; `None` keeps Jira's order.
+    pub sort: Option<Sort>,
+    /// Priority names in Jira's order, highest first (empty until fetched).
+    pub priorities: Vec<String>,
+    /// Status names hidden from the list.
+    pub hidden_statuses: BTreeSet<String>,
+    /// Rows offered by the status filter picker.
+    pub status_choices: Vec<String>,
 
     pub transitions: Vec<Transition>,
     pub transitions_for: String,
@@ -176,6 +299,11 @@ impl App {
             fatal: None,
             filter_idx: 0,
             picker_sel: 0,
+            sort_col: 0,
+            sort: None,
+            priorities: vec![],
+            hidden_statuses: BTreeSet::new(),
+            status_choices: vec![],
             transitions: vec![],
             transitions_for: String::new(),
             transitions_loading: false,
@@ -228,21 +356,123 @@ impl App {
         self.client_gen += 1;
         self.me = None;
         self.assign_seq += 1;
+        self.priorities.clear();
+        self.request_priorities();
+    }
+
+    /// Fetch the instance's priority order for sorting. On failure
+    /// priorities sort alphabetically, so errors are not shown.
+    fn request_priorities(&self) {
+        let Some(client) = self.client.clone() else { return };
+        let gen = self.client_gen;
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(Resp::Priorities {
+                gen,
+                result: client.priorities(),
+            });
+        });
     }
 
     /// Rows currently on screen: top-level issues, with the children of every
     /// expanded epic inlined right below it. `u8` is the indent depth.
+    /// Issues with a hidden status are left out; with a sort active, issues
+    /// (and each epic's children) are ordered by it.
     pub fn visible(&self) -> Vec<(&Issue, u8)> {
-        let mut rows = Vec::with_capacity(self.issues.len());
-        for issue in &self.issues {
+        let shown = |i: &&Issue| !self.hidden_statuses.contains(&i.status);
+        let order = |list: &mut Vec<&Issue>| {
+            if let Some(sort) = self.sort {
+                list.sort_by(|a, b| compare_issues(a, b, sort, &self.priorities));
+            }
+        };
+        let mut top: Vec<&Issue> = self.issues.iter().filter(shown).collect();
+        order(&mut top);
+        let mut rows = Vec::with_capacity(top.len());
+        for issue in top {
             rows.push((issue, 0));
             if is_epic(issue) && self.expanded.contains(&issue.key) {
                 if let Some(kids) = self.children.get(&issue.key) {
-                    rows.extend(kids.iter().map(|k| (k, 1)));
+                    let mut kids: Vec<&Issue> = kids.iter().filter(shown).collect();
+                    order(&mut kids);
+                    rows.extend(kids.into_iter().map(|k| (k, 1)));
                 }
             }
         }
         rows
+    }
+
+    /// Top-level issues hidden by the status filter.
+    pub fn hidden_count(&self) -> usize {
+        self.issues
+            .iter()
+            .filter(|i| self.hidden_statuses.contains(&i.status))
+            .count()
+    }
+
+    /// Re-select the row showing `key` after the list was re-ordered or
+    /// filtered; clamp when that issue is no longer visible.
+    fn reselect(&mut self, key: Option<String>) {
+        let vis = self.visible();
+        self.selected = key
+            .and_then(|k| vis.iter().position(|(i, _)| i.key == k))
+            .unwrap_or(self.selected)
+            .min(vis.len().saturating_sub(1));
+    }
+
+    /// Sort by the column under the header cursor; again toggles direction.
+    fn sort_by_selected_column(&mut self) {
+        let column = Column::ALL[self.sort_col];
+        let ascending = match self.sort {
+            Some(s) if s.column == column => !s.ascending,
+            _ => true,
+        };
+        let key = self.selected_issue().map(|i| i.key.clone());
+        self.sort = Some(Sort { column, ascending });
+        self.reselect(key);
+        let dir = if ascending { "ascending" } else { "descending" };
+        self.toast(format!("sorted by {} ({dir})", column.title().to_lowercase()), false);
+    }
+
+    fn clear_sort(&mut self) {
+        if self.sort.take().is_some() {
+            let key = self.selected_issue().map(|i| i.key.clone());
+            self.reselect(key);
+            self.toast("sort cleared — Jira order", false);
+        }
+    }
+
+    /// Statuses offered by the filter picker: those of loaded issues plus any
+    /// already hidden, alphabetically.
+    fn open_status_filter_picker(&mut self) {
+        let mut choices: BTreeSet<String> = self
+            .issues
+            .iter()
+            .chain(self.children.values().flatten())
+            .map(|i| i.status.clone())
+            .collect();
+        choices.extend(self.hidden_statuses.iter().cloned());
+        self.status_choices = choices.into_iter().collect();
+        self.picker_sel = 0;
+        self.view = View::StatusFilterPicker;
+    }
+
+    fn toggle_hidden_status(&mut self, row: usize) {
+        let Some(status) = self.status_choices.get(row).cloned() else { return };
+        let key = self.selected_issue().map(|i| i.key.clone());
+        if !self.hidden_statuses.remove(&status) {
+            self.hidden_statuses.insert(status);
+        }
+        self.reselect(key);
+    }
+
+    fn clear_status_filter(&mut self) {
+        if self.hidden_statuses.is_empty() {
+            return;
+        }
+        let key = self.selected_issue().map(|i| i.key.clone());
+        self.hidden_statuses.clear();
+        self.reselect(key);
+        self.toast("status filter cleared", false);
     }
 
     pub fn selected_issue(&self) -> Option<&Issue> {
@@ -674,7 +904,7 @@ impl App {
                         self.children.clear();
                         self.expanded.clear();
                         self.loading_children.clear();
-                        self.selected = self.selected.min(self.issues.len().saturating_sub(1));
+                        self.selected = self.selected.min(self.visible().len().saturating_sub(1));
                     }
                     Err(e) => self.toast(format!("Jira: {e}"), true),
                 }
@@ -699,6 +929,13 @@ impl App {
                 }
                 Err(e) => self.toast(format!("{key}: {e}"), true),
             },
+            Resp::Priorities { gen, result } => {
+                if gen == self.client_gen {
+                    if let Ok(names) = result {
+                        self.priorities = names;
+                    }
+                }
+            }
             Resp::Me { gen, .. } if gen != self.client_gen => {}
             Resp::Me { result, .. } => match result {
                 Ok(me) => {
@@ -858,6 +1095,7 @@ impl App {
             View::FilterPicker => self.keys_filter_picker(key),
             View::TransitionPicker => self.keys_transition_picker(key),
             View::AssigneePicker => self.keys_assignee_picker(key),
+            View::StatusFilterPicker => self.keys_status_filter_picker(key),
             View::AgentPicker => self.keys_agent_picker(key),
             View::NewAgentTypePicker => self.keys_new_agent_type(key),
             View::NewAgentWorkspacePicker => self.keys_new_agent_workspace(key),
@@ -930,6 +1168,16 @@ impl App {
             KeyCode::Char('d') => self.request_agents(),
             KeyCode::Char('o') => self.open_in_browser(),
             KeyCode::Char('z') => self.zoom_toggle(),
+            KeyCode::Char('[') => {
+                self.sort_col = Self::move_sel(Column::ALL.len(), self.sort_col, -1)
+            }
+            KeyCode::Char(']') => {
+                self.sort_col = Self::move_sel(Column::ALL.len(), self.sort_col, 1)
+            }
+            KeyCode::Char('S') => self.sort_by_selected_column(),
+            KeyCode::Char('U') => self.clear_sort(),
+            KeyCode::Char('x') => self.open_status_filter_picker(),
+            KeyCode::Char('X') => self.clear_status_filter(),
             KeyCode::Char('?') => self.view = View::Help,
             _ => {}
         }
@@ -1041,6 +1289,28 @@ impl App {
                 self.assign_query.push(c);
                 self.search_assignees();
             }
+            _ => {}
+        }
+    }
+
+    /// Space/Enter/1-9 toggle a status; the picker stays open for more.
+    fn keys_status_filter_picker(&mut self, key: KeyEvent) {
+        let len = self.status_choices.len();
+        if let Some(idx) = Self::picker_number(&key, len) {
+            self.picker_sel = idx;
+            self.toggle_hidden_status(idx);
+            return;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('x') => self.view = View::List,
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.picker_sel = Self::move_sel(len, self.picker_sel, 1)
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.picker_sel = Self::move_sel(len, self.picker_sel, -1)
+            }
+            KeyCode::Char(' ') | KeyCode::Enter => self.toggle_hidden_status(self.picker_sel),
+            KeyCode::Char('c') | KeyCode::Char('X') => self.clear_status_filter(),
             _ => {}
         }
     }
@@ -1523,6 +1793,152 @@ mod tests {
             result: Ok(user("new", "New")),
         });
         assert_eq!(app.me, Some(user("new", "New")));
+    }
+
+    fn issue(key: &str, status: &str, priority: &str) -> Issue {
+        Issue {
+            key: key.into(),
+            status: status.into(),
+            status_category: match status {
+                "Done" => "done",
+                "In Progress" => "indeterminate",
+                _ => "new",
+            }
+            .into(),
+            priority: priority.into(),
+            ..test_issue()
+        }
+    }
+
+    fn list_app() -> App {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::blank(tx);
+        app.issues = vec![
+            issue("P-2", "Done", "Low"),
+            issue("P-10", "To Do", "Highest"),
+            issue("P-3", "In Progress", "—"),
+            issue("P-1", "To Do", "Medium"),
+            issue("P-4", "Done", "High"),
+        ];
+        app
+    }
+
+    fn keys(app: &App) -> Vec<&str> {
+        app.visible().iter().map(|(i, _)| i.key.as_str()).collect()
+    }
+
+    fn sort_on(app: &mut App, col: Column) {
+        let idx = Column::ALL.iter().position(|&c| c == col).unwrap();
+        while app.sort_col > idx {
+            press(app, KeyCode::Char('['));
+        }
+        while app.sort_col < idx {
+            press(app, KeyCode::Char(']'));
+        }
+        press(app, KeyCode::Char('S'));
+    }
+
+    #[test]
+    fn priority_sorts_by_jira_order_and_toggles() {
+        let mut app = list_app();
+        app.priorities = ["Highest", "High", "Medium", "Low", "Lowest"]
+            .map(String::from)
+            .to_vec();
+        sort_on(&mut app, Column::Priority);
+        assert_eq!(
+            app.sort,
+            Some(Sort { column: Column::Priority, ascending: true })
+        );
+        // Highest → Lowest, not alphabetical; no priority stays last.
+        assert_eq!(keys(&app), vec!["P-10", "P-4", "P-1", "P-2", "P-3"]);
+        press(&mut app, KeyCode::Char('S'));
+        assert!(!app.sort.unwrap().ascending);
+        assert_eq!(keys(&app), vec!["P-2", "P-1", "P-4", "P-10", "P-3"]);
+        press(&mut app, KeyCode::Char('S'));
+        assert!(app.sort.unwrap().ascending);
+    }
+
+    #[test]
+    fn priorities_missing_from_jira_order_sort_after_it_alphabetically() {
+        let mut app = list_app();
+        app.priorities = vec!["Low".into(), "Highest".into()];
+        sort_on(&mut app, Column::Priority);
+        // Fetched order first, then the rest alphabetically, then no priority.
+        assert_eq!(keys(&app), vec!["P-2", "P-10", "P-4", "P-1", "P-3"]);
+    }
+
+    #[test]
+    fn priorities_sort_alphabetically_when_jira_order_is_unknown() {
+        let mut app = list_app();
+        sort_on(&mut app, Column::Priority);
+        assert_eq!(keys(&app), vec!["P-4", "P-10", "P-2", "P-1", "P-3"]);
+        press(&mut app, KeyCode::Char('S'));
+        assert_eq!(keys(&app), vec!["P-1", "P-2", "P-10", "P-4", "P-3"]);
+    }
+
+    #[test]
+    fn key_sort_is_numeric_and_u_restores_jira_order() {
+        let mut app = list_app();
+        sort_on(&mut app, Column::Key);
+        assert_eq!(keys(&app), vec!["P-1", "P-2", "P-3", "P-4", "P-10"]);
+        press(&mut app, KeyCode::Char('U'));
+        assert_eq!(app.sort, None);
+        assert_eq!(keys(&app), vec!["P-2", "P-10", "P-3", "P-1", "P-4"]);
+    }
+
+    #[test]
+    fn sorting_another_column_starts_ascending_and_keeps_selection() {
+        let mut app = list_app();
+        sort_on(&mut app, Column::Key);
+        press(&mut app, KeyCode::Char('S'));
+        app.selected = 0; // P-10
+        sort_on(&mut app, Column::Status);
+        assert!(app.sort.unwrap().ascending);
+        // By category (to do, in progress, done); Jira order within a status.
+        assert_eq!(keys(&app), vec!["P-10", "P-1", "P-3", "P-2", "P-4"]);
+        assert_eq!(app.selected_issue().unwrap().key, "P-10");
+    }
+
+    #[test]
+    fn status_filter_hides_toggles_and_clears() {
+        let mut app = list_app();
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.view, View::StatusFilterPicker);
+        assert_eq!(app.status_choices, vec!["Done", "In Progress", "To Do"]);
+        press(&mut app, KeyCode::Char('1')); // hide Done
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Char(' ')); // hide In Progress
+        assert_eq!(app.view, View::StatusFilterPicker, "stays open for more");
+        assert_eq!(keys(&app), vec!["P-10", "P-1"]);
+        assert_eq!(app.hidden_count(), 3);
+        press(&mut app, KeyCode::Enter); // show In Progress again
+        assert_eq!(keys(&app), vec!["P-10", "P-3", "P-1"]);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.view, View::List);
+
+        // The filter survives a reload and still lists hidden statuses.
+        app.on_resp(Resp::Issues {
+            title: "again".into(),
+            result: Ok(vec![issue("P-5", "Done", "Low"), issue("P-6", "To Do", "Low")]),
+        });
+        assert_eq!(keys(&app), vec!["P-6"]);
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.status_choices, vec!["Done", "To Do"]);
+        press(&mut app, KeyCode::Esc);
+
+        press(&mut app, KeyCode::Char('X'));
+        assert!(app.hidden_statuses.is_empty());
+        assert_eq!(keys(&app), vec!["P-5", "P-6"]);
+    }
+
+    #[test]
+    fn hiding_the_selected_issue_clamps_selection() {
+        let mut app = list_app();
+        app.selected = 4; // P-4, Done
+        app.hidden_statuses.insert("Done".into());
+        app.reselect(Some("P-4".into()));
+        assert_eq!(app.selected, 2);
+        assert!(app.selected_issue().is_some());
     }
 
     #[test]
