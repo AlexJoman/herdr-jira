@@ -1,9 +1,9 @@
 # herdr-jira
 
 A Jira TUI that lives in a [herdr](https://herdr.dev) pane: browse issues through
-configurable JQL filters, search, change issue status, and delegate an issue to
-any AI agent in herdr with one key — pick a running agent, or start a new one
-in a chosen directory. The agent receives a prompt built from a configurable
+configurable JQL filters, search, change issue status and assignee, and delegate
+an issue to any AI agent in herdr with one key — pick a running agent, or start
+a new one in a chosen directory. The agent receives a prompt built from a configurable
 template (issue key, summary, description, link, …).
 
 ```
@@ -28,6 +28,10 @@ template (issue key, summary, description, link, …).
   (Cloud ADF documents are flattened to plain text).
 - **Status transitions** — `s` lists the transitions available for the issue
   and applies the one you pick.
+- **Assignee** — `a` opens an assignee picker: **assign to me**, **unassign**,
+  or type to search the users assignable to that issue, then `Enter`. The
+  issue list is refreshed after the change; errors such as a missing
+  permission show in the footer.
 - **Delegate to an agent** — `d` lists agents currently running in herdr
   (claude, codex, grok, …) with status and cwd; pick one and the issue is sent
   as a prompt from your `[delegate].prompt` template and submitted server-side
@@ -149,6 +153,7 @@ command = "herdr-jira.open-jira-tab"
 | `/` | search |
 | `J` | run a custom JQL query (prefilled with the current one) |
 | `s` | change issue status |
+| `a` | assign issue: to me, unassign, or type to search assignable users |
 | `d` | delegate issue to a running agent, or start a new one |
 | `n` | in the delegate picker: start a new agent |
 | `1`–`9` | quick pick inside any popup (agents, transitions, filters) |
