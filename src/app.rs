@@ -131,6 +131,8 @@ pub struct App {
     pub search_input: String,
     pub jql_input: String,
     pub last_jql: String,
+    /// Plain text-search JQL to retry with if `last_jql` is rejected (HTTP 400).
+    last_fallback_jql: Option<String>,
     pub detail_scroll: u16,
 
     pub toast: Option<(String, bool, Instant)>, // message, is_error, shown_at
@@ -195,6 +197,7 @@ impl App {
             search_input: String::new(),
             jql_input: String::new(),
             last_jql: String::new(),
+            last_fallback_jql: None,
             detail_scroll: 0,
             toast: None,
         }
@@ -252,13 +255,14 @@ impl App {
 
     // ---- background requests ----
 
-    fn spawn_search(&mut self, jql: String, title: String) {
+    fn spawn_search(&mut self, jql: String, fallback: Option<String>, title: String) {
         let Some(client) = self.client.clone() else { return };
         self.last_jql = jql.clone();
+        self.last_fallback_jql = fallback.clone();
         self.loading = true;
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let result = client.search(&jql);
+            let result = search_with_fallback(|q| client.search(q), &jql, fallback.as_deref());
             let _ = tx.send(Resp::Issues { title, result });
         });
     }
@@ -267,15 +271,14 @@ impl App {
         let Some(filter) = self.cfg.filters.get(idx).cloned() else { return };
         self.filter_idx = idx;
         let jql = self.cfg.expand_jql(&filter.jql);
-        self.spawn_search(jql, filter.name);
+        self.spawn_search(jql, None, filter.name);
     }
 
     fn run_search(&mut self, query: String) {
-        let jql = self
-            .cfg
-            .expand_jql(&self.cfg.search.jql.clone())
-            .replace("{query}", &query.replace('"', "\\\""));
-        self.spawn_search(jql, format!("search: {query}"));
+        let jql = self.cfg.search_jql(&query);
+        let text_jql = self.cfg.text_search_jql(&query);
+        let fallback = (jql != text_jql).then_some(text_jql);
+        self.spawn_search(jql, fallback, format!("search: {query}"));
     }
 
     fn request_transitions(&mut self) {
@@ -751,7 +754,11 @@ impl App {
                     // Re-run the current query so the list reflects the change
                     // (e.g. an unassigned issue leaving "My open issues").
                     if !self.last_jql.is_empty() {
-                        self.spawn_search(self.last_jql.clone(), self.current_title.clone());
+                        self.spawn_search(
+                            self.last_jql.clone(),
+                            self.last_fallback_jql.clone(),
+                            self.current_title.clone(),
+                        );
                     }
                 }
                 Err(e) => self.toast(format!("{key}: assign: {e}"), true),
@@ -1225,7 +1232,7 @@ impl App {
                 self.view = View::List;
                 if !jql.is_empty() {
                     let expanded = self.cfg.expand_jql(&jql);
-                    self.spawn_search(expanded, "custom JQL".into());
+                    self.spawn_search(expanded, None, "custom JQL".into());
                 }
             }
             KeyCode::Backspace => {
@@ -1237,6 +1244,19 @@ impl App {
             KeyCode::Char(c) => self.jql_input.push(c),
             _ => {}
         }
+    }
+}
+
+/// Jira Server/DC rejects `key = "X-1"` with HTTP 400 when the key does not
+/// exist; retry such a search once with `fallback`.
+fn search_with_fallback<T>(
+    search: impl Fn(&str) -> Result<T, String>,
+    jql: &str,
+    fallback: Option<&str>,
+) -> Result<T, String> {
+    match (search(jql), fallback) {
+        (Err(e), Some(fallback)) if e.starts_with("HTTP 400") => search(fallback),
+        (result, _) => result,
     }
 }
 
@@ -1323,6 +1343,77 @@ mod tests {
 
     fn press(app: &mut App, code: KeyCode) {
         app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn slash_search_for_an_issue_key_queries_that_key() {
+        let (mut app, _rx) = assign_app();
+        press(&mut app, KeyCode::Char('/'));
+        for c in " proj-7 ".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.view, View::List);
+        assert_eq!(
+            app.last_jql,
+            r#"key = "PROJ-7" OR (text ~ "proj-7") ORDER BY updated DESC"#
+        );
+    }
+
+    #[test]
+    fn rejected_key_search_retries_with_plain_text_search() {
+        let (mut app, _rx) = assign_app();
+        press(&mut app, KeyCode::Char('/'));
+        for c in "utf-8".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        let fallback = app.last_fallback_jql.clone().unwrap();
+        assert_eq!(fallback, r#"text ~ "utf-8" ORDER BY updated DESC"#);
+
+        let calls = std::cell::RefCell::new(vec![]);
+        let result = search_with_fallback(
+            |q| {
+                calls.borrow_mut().push(q.to_string());
+                if q.starts_with("key = ") {
+                    Err("HTTP 400: An issue with key 'UTF-8' does not exist for field 'key'.".into())
+                } else {
+                    Ok(vec!["hit"])
+                }
+            },
+            &app.last_jql,
+            Some(&fallback),
+        );
+        assert_eq!(result, Ok(vec!["hit"]));
+        assert_eq!(*calls.borrow(), vec![app.last_jql.clone(), fallback]);
+    }
+
+    #[test]
+    fn search_fallback_only_on_http_400() {
+        let calls = std::cell::Cell::new(0);
+        let calls = &calls;
+        let fail = |e: &'static str| {
+            move |_: &str| -> Result<(), String> {
+                calls.set(calls.get() + 1);
+                Err(e.into())
+            }
+        };
+        assert_eq!(search_with_fallback(fail("HTTP 401: no"), "a", Some("b")), Err("HTTP 401: no".into()));
+        assert_eq!(calls.get(), 1);
+        calls.set(0);
+        assert_eq!(search_with_fallback(fail("HTTP 400: bad"), "a", None), Err("HTTP 400: bad".into()));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn plain_search_has_no_fallback() {
+        let (mut app, _rx) = assign_app();
+        press(&mut app, KeyCode::Char('/'));
+        for c in "login bug".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.last_fallback_jql, None);
     }
 
     #[test]

@@ -19,7 +19,8 @@ template (issue key, summary, description, link, …).
 
 - **Filters** — named JQL filters from the config (`f` or `1`–`9`): my issues,
   a specific project, anything JQL can express.
-- **Search** — `/` runs a `text ~ "…"` search (template configurable), and `J`
+- **Search** — `/` runs a `text ~ "…"` search (template configurable); typing
+  an issue key such as `abc-123` also finds that issue itself. `J`
   runs any raw JQL you type, prefilled with the current query for quick tweaks.
 - **Epics** — epics stand out with a magenta type badge and a `▸` marker;
   `→` expands one inline to show its child issues (`parent = …`, with a

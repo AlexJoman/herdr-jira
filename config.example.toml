@@ -49,6 +49,7 @@ jql = "project = {project} ORDER BY updated DESC"
 
 [search]
 # JQL template used by `/` search. Placeholders: {query}, {project}.
+# A query that is an issue key (e.g. ABC-123) also matches that issue by key.
 jql = 'text ~ "{query}" ORDER BY updated DESC'
 # To scope search to the default project instead:
 # jql = 'project = {project} AND text ~ "{query}" ORDER BY updated DESC'
