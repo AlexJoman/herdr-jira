@@ -292,7 +292,7 @@ impl App {
                     api_token_cmd: String::new(),
                     default_project: String::new(),
                     max_results: 100,
-                    max_issues: 1000,
+                    max_issues: 0,
                 },
                 filters: vec![],
                 search: Default::default(),

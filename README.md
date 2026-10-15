@@ -31,8 +31,8 @@ template (issue key, summary, description, link, …).
   page shows straight away; the title shows `⟳ loaded N of M…` (or `loaded N…`
   where Jira does not report a total) while the rest arrive, and sort and the
   status filter apply to the whole list as it grows. `[jira].max_results` sets
-  the page size (default 100). `[jira].max_issues` caps one load (default
-  1000, `0` = no limit) to stop runaway JQL; when the cap is hit the title
+  the page size (default 100). `[jira].max_issues` optionally caps one load
+  (default `0` = no limit); when the cap is hit the title
   shows `first N … (max_issues)`. Switching filter, searching or refreshing
   cancels a load that is still paging.
 - **Columns** — key, type, status, priority, assignee, updated and summary.

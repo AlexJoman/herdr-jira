@@ -30,9 +30,9 @@ default_project = "PROJ"
 # (Jira may return fewer per page than asked for; paging handles that).
 max_results = 100
 
-# Upper bound on issues loaded per filter/search, to stop runaway loads on
-# very broad JQL. The title shows "(cap N)" when it is hit. 0 = no limit.
-max_issues = 1000
+# Optional upper bound on issues loaded per filter/search. The title shows
+# "first N of M (max_issues)" when it is hit. 0 = no limit (default).
+max_issues = 0
 
 # --- Filters ---
 # Named JQL filters, switchable in the TUI with `f` (or keys 1-9).

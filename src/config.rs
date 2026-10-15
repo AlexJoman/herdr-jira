@@ -126,7 +126,7 @@ fn default_max_results() -> u32 {
     100
 }
 fn default_max_issues() -> u32 {
-    1000
+    0
 }
 fn default_search_jql() -> String {
     r#"text ~ "{query}" ORDER BY updated DESC"#.into()

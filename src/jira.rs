@@ -317,8 +317,9 @@ impl JiraClient {
 
 /// Drive a paged search: `fetch` gets one page per cursor and `on_page`
 /// receives each page's raw issues with the reported total, whether it is
-/// the last page, and whether that is because `limit` cut it short. Stops when the results run out, `limit` issues have been
-/// delivered, or `on_page` returns `false`. Handles both paging contracts:
+/// the last page, and whether that is because `limit` cut it short. Issues
+/// already delivered on an earlier page are dropped. Stops when the results
+/// run out, `limit` issues have been delivered, or `on_page` returns `false`. Handles both paging contracts:
 /// `nextPageToken`/`isLast` (`/search/jql`) and `startAt`/`total` (`/search`).
 fn paginate(
     limit: usize,
@@ -327,6 +328,7 @@ fn paginate(
 ) -> Result<(), String> {
     let mut cursor = Cursor::First;
     let mut delivered = 0usize;
+    let mut seen = std::collections::HashSet::new();
     loop {
         let v = fetch(&cursor)?;
         let mut raw = v["issues"].as_array().cloned().unwrap_or_default();
@@ -349,6 +351,7 @@ fn paginate(
                 }
             }
         };
+        raw.retain(|i| seen.insert(i["key"].as_str().unwrap_or_default().to_string()));
         raw.truncate(limit - delivered);
         delivered += raw.len();
         let capped = delivered >= limit && (got > raw.len() || next.is_some());
@@ -633,6 +636,22 @@ mod tests {
         assert_eq!(pages.len(), 3);
         assert!(pages.iter().all(|p| p.1 == Some(5)));
         assert_eq!(pages.iter().map(|p| p.2).collect::<Vec<_>>(), [false, false, true]);
+    }
+
+    #[test]
+    fn paginate_drops_issues_repeated_by_a_shifted_offset() {
+        let (cursors, pages) = run_pages(
+            1000,
+            vec![
+                serde_json::json!({ "startAt": 0, "total": 5, "issues": raw_issues(0..2) }),
+                serde_json::json!({ "startAt": 2, "total": 5, "issues": raw_issues(1..3) }),
+                serde_json::json!({ "startAt": 4, "total": 5, "issues": raw_issues(3..4) }),
+            ],
+            usize::MAX,
+        );
+        assert_eq!(cursors.len(), 3);
+        let keys: Vec<String> = pages.into_iter().flat_map(|p| p.0).collect();
+        assert_eq!(keys, vec!["P-0", "P-1", "P-2", "P-3"]);
     }
 
     #[test]
