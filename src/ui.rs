@@ -1,7 +1,7 @@
 //! Rendering. One draw function per view; popup pickers render on top of the
 //! issue list.
 
-use crate::app::{is_epic, App, View};
+use crate::app::{is_epic, App, Column, View};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
@@ -31,6 +31,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         View::FilterPicker => draw_filter_picker(f, app),
         View::TransitionPicker => draw_transition_picker(f, app),
         View::AssigneePicker => draw_assignee_picker(f, app),
+        View::StatusFilterPicker => draw_status_filter_picker(f, app),
         View::AgentPicker => draw_agent_picker(f, app),
         View::NewAgentTypePicker => draw_new_agent_type_picker(f, app),
         View::NewAgentWorkspacePicker => draw_new_agent_workspace_picker(f, app),
@@ -52,6 +53,17 @@ fn status_color(category: &str) -> Color {
     }
 }
 
+fn priority_color(priority: &str) -> Color {
+    match priority.to_ascii_lowercase().as_str() {
+        "highest" | "blocker" | "critical" => Color::Red,
+        "high" | "major" => Color::LightRed,
+        "medium" | "normal" => Color::Yellow,
+        "low" | "minor" => Color::Green,
+        "lowest" | "trivial" => Color::Blue,
+        _ => Color::Gray,
+    }
+}
+
 fn type_style(issue_type: &str) -> Style {
     match issue_type.to_ascii_lowercase().as_str() {
         "epic" => Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
@@ -64,19 +76,30 @@ fn type_style(issue_type: &str) -> Style {
 }
 
 fn draw_list(f: &mut Frame, app: &App, area: Rect) {
+    let hidden = app.hidden_count();
     let title = if app.current_title.is_empty() {
         "Jira".to_string()
+    } else if hidden > 0 {
+        let shown = app.issues.len() - hidden;
+        format!("Jira — {} ({shown}/{})", app.current_title, app.issues.len())
     } else {
         format!("Jira — {} ({})", app.current_title, app.issues.len())
     };
-    let suffix = if app.loading { "  ⟳ loading…" } else { "" };
+    let mut title_spans = vec![Span::styled(format!(" {title} "), Style::new().fg(ACCENT).bold())];
+    if !app.hidden_statuses.is_empty() {
+        let names: Vec<&str> = app.hidden_statuses.iter().map(String::as_str).collect();
+        title_spans.push(Span::styled(
+            format!(" hiding: {} (x edit · X clear) ", names.join(", ")),
+            Style::new().fg(Color::Black).bg(Color::Yellow),
+        ));
+    }
+    if app.loading {
+        title_spans.push(Span::styled("  ⟳ loading…", Style::new().fg(Color::Yellow)));
+    }
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .title(Line::from(vec![
-            Span::styled(format!(" {title} "), Style::new().fg(ACCENT).bold()),
-            Span::styled(suffix, Style::new().fg(Color::Yellow)),
-        ]))
+        .title(Line::from(title_spans))
         .title_alignment(Alignment::Left);
 
     let visible = app.visible();
@@ -96,6 +119,7 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
                 Cell::from(format!("{prefix}{}", i.key)).style(key_style),
                 Cell::from(i.issue_type.clone()).style(type_style(&i.issue_type)),
                 Cell::from(i.status.clone()).style(Style::new().fg(status_color(&i.status_category))),
+                Cell::from(i.priority.clone()).style(Style::new().fg(priority_color(&i.priority))),
                 Cell::from(i.assignee.clone()).style(Style::new().fg(Color::Magenta)),
                 Cell::from(i.updated.clone()).style(Style::new().fg(Color::DarkGray)),
                 Cell::from(i.summary.clone()),
@@ -110,15 +134,13 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
             Constraint::Length(15),
             Constraint::Length(7),
             Constraint::Length(14),
+            Constraint::Length(10),
             Constraint::Length(18),
             Constraint::Length(16),
             Constraint::Min(20),
         ],
     )
-    .header(
-        Row::new(vec!["KEY", "TYPE", "STATUS", "ASSIGNEE", "UPDATED", "SUMMARY"])
-            .style(Style::new().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
-    )
+    .header(header_row(app))
     .row_highlight_style(Style::new().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
     .block(block);
 
@@ -127,12 +149,35 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(table, area, &mut state);
 
     if is_empty && !app.loading {
-        let empty = Paragraph::new("no issues — press r to refresh, f to pick a filter, / to search")
+        let msg = if hidden > 0 {
+            "all issues hidden by the status filter — x to edit, X to clear"
+        } else {
+            "no issues — press r to refresh, f to pick a filter, / to search"
+        };
+        let empty = Paragraph::new(msg)
             .style(Style::new().fg(Color::DarkGray))
             .alignment(Alignment::Center);
         let inner = centered_rect(area, 80, 20);
         f.render_widget(empty, inner);
     }
+}
+
+/// Column titles; the active sort column carries ▲/▼ and the column under
+/// the header cursor (`[`/`]`) is highlighted.
+fn header_row(app: &App) -> Row<'static> {
+    let cells = Column::ALL.iter().enumerate().map(|(idx, &col)| {
+        let mut text = col.title().to_string();
+        let mut style = Style::new().fg(Color::DarkGray).add_modifier(Modifier::BOLD);
+        if let Some(sort) = app.sort.filter(|s| s.column == col) {
+            text.push_str(if sort.ascending { " ▲" } else { " ▼" });
+            style = style.fg(Color::Yellow);
+        }
+        if idx == app.sort_col {
+            style = style.fg(ACCENT).add_modifier(Modifier::UNDERLINED);
+        }
+        Cell::from(text).style(style)
+    });
+    Row::new(cells)
 }
 
 fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
@@ -221,10 +266,13 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         | View::NewAgentCwdPicker => {
             "1-9 pick  ·  j/k move  ·  Enter select  ·  Esc back"
         }
+        View::StatusFilterPicker => {
+            "Space/Enter/1-9 toggle hidden  ·  j/k move  ·  c clear all  ·  Esc done"
+        }
         View::FilterPicker | View::TransitionPicker => {
             "1-9 quick pick  ·  j/k move  ·  Enter select  ·  Esc cancel"
         }
-        _ => "Enter open  ·  →/← epic  ·  f filters  ·  / search  ·  s status  ·  a assignee  ·  d delegate  ·  z zoom  ·  r refresh  ·  ? help  ·  q quit",
+        _ => "Enter open · →/← epic · f filters · / search · [/] S sort · x hide status · s status · a assignee · d delegate · r refresh · ? help · q quit",
     };
     f.render_widget(
         Paragraph::new(hints).style(Style::new().fg(Color::DarkGray)),
@@ -357,6 +405,37 @@ fn draw_assignee_picker(f: &mut Frame, app: &App) {
         ]))
     }));
     render_picker_list(f, list, items, app.picker_sel);
+}
+
+fn draw_status_filter_picker(f: &mut Frame, app: &App) {
+    let h = (app.status_choices.len() as u16 + 2).clamp(3, 18);
+    let inner = popup(f, "hide statuses", 50, h);
+    if app.status_choices.is_empty() {
+        f.render_widget(
+            Paragraph::new("no issues loaded").style(Style::new().fg(Color::DarkGray)),
+            inner,
+        );
+        return;
+    }
+    let items: Vec<ListItem> = app
+        .status_choices
+        .iter()
+        .enumerate()
+        .map(|(i, status)| {
+            let hidden = app.hidden_statuses.contains(status);
+            let (mark, style) = if hidden {
+                ("[x] ", Style::new().fg(Color::DarkGray).add_modifier(Modifier::CROSSED_OUT))
+            } else {
+                ("[ ] ", Style::new())
+            };
+            ListItem::new(Line::from(vec![
+                num_span(i),
+                Span::styled(mark, Style::new().fg(Color::Yellow)),
+                Span::styled(status.clone(), style),
+            ]))
+        })
+        .collect();
+    render_picker_list(f, inner, items, app.picker_sel);
 }
 
 fn draw_agent_picker(f: &mut Frame, app: &App) {
@@ -614,7 +693,7 @@ fn draw_jql(f: &mut Frame, app: &App) {
 }
 
 fn draw_help(f: &mut Frame) {
-    let inner = popup(f, "help", 60, 21);
+    let inner = popup(f, "help", 60, 26);
     let rows = [
         ("j/k ↑/↓", "move / scroll"),
         ("Enter", "open issue details"),
@@ -622,6 +701,11 @@ fn draw_help(f: &mut Frame) {
         ("f, 1-9", "switch filter"),
         ("/", "search (text ~ query)"),
         ("J", "run custom JQL (prefilled with current)"),
+        ("[ / ]", "move column cursor (header)"),
+        ("S", "sort by that column; again: reverse"),
+        ("U", "clear sort (back to Jira order)"),
+        ("x", "hide issues by status (picker)"),
+        ("X", "clear status filter"),
         ("1-9", "quick pick in any popup"),
         ("s", "change issue status"),
         ("a", "assign: to me, unassign, or search users"),

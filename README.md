@@ -7,12 +7,12 @@ a new one in a chosen directory. The agent receives a prompt built from a config
 template (issue key, summary, description, link, …).
 
 ```
-╭ Jira — My open issues (23) ─────────────────────────────────────────╮
-│ KEY         STATUS        ASSIGNEE          UPDATED          SUMMARY│
-│ PROJ-142    In Progress   Vitalii R.        2026-07-14 10:02 Fix …  │
-│ PROJ-137    To Do         Vitalii R.        2026-07-13 18:40 Add …  │
-╰─────────────────────────────────────────────────────────────────────╯
- Enter open · f filters · / search · s status · d delegate · o browser
+╭ Jira — My open issues (21/23)  hiding: Done ───────────────────────────────────────╮
+│ KEY         STATUS        PRIORITY ▲  ASSIGNEE          UPDATED          SUMMARY   │
+│ PROJ-142    In Progress   Highest     Vitalii R.        2026-07-14 10:02 Fix …     │
+│ PROJ-137    To Do         Medium      Vitalii R.        2026-07-13 18:40 Add …     │
+╰────────────────────────────────────────────────────────────────────────────────────╯
+ Enter open · f filters · / search · S sort · x hide status · s status · d delegate
 ```
 
 ## Features
@@ -25,6 +25,18 @@ template (issue key, summary, description, link, …).
 - **Epics** — epics stand out with a magenta type badge and a `▸` marker;
   `→` expands one inline to show its child issues (`parent = …`, with a
   `"Epic Link"` fallback for Server/DC), `←` collapses it.
+- **Columns** — key, type, status, priority, assignee, updated and summary.
+- **Sort** — `[`/`]` move the header cursor to a column, `S` sorts the list by
+  it; press `S` again to reverse. The sorted column shows `▲`/`▼`. Priority
+  sorts in Jira's own priority order (Highest first when ascending, issues
+  without a priority last), not alphabetically; status sorts by category
+  (to do → in progress → done). `U` returns to the order Jira sent. The sort
+  is kept across filters and refreshes.
+- **Hide statuses** — `x` opens a picker of the statuses in the current list;
+  `Space`/`Enter`/`1`–`9` toggle which ones are hidden. While any are hidden
+  the title shows `hiding: …` and the shown/total count; `c` in the picker or
+  `X` in the list clears it. The filter is applied locally and persists
+  across filters and refreshes.
 - **Issue details** — `Enter` opens a scrollable view with the description
   (Cloud ADF documents are flattened to plain text).
 - **Status transitions** — `s` lists the transitions available for the issue
@@ -153,6 +165,11 @@ command = "herdr-jira.open-jira-tab"
 | `f`, `1`–`9` | switch filter |
 | `/` | search |
 | `J` | run a custom JQL query (prefilled with the current one) |
+| `[`/`]` | move the column cursor in the header |
+| `S` | sort by the column under the cursor; again reverses the direction |
+| `U` | clear the sort (back to Jira's order) |
+| `x` | hide issues by status (multi-select picker) |
+| `X` | clear the status filter |
 | `s` | change issue status |
 | `a` | assign issue: to me, unassign, or type to search assignable users |
 | `d` | delegate issue to a running agent, or start a new one |

@@ -214,6 +214,11 @@ impl JiraClient {
         Ok(())
     }
 
+    /// Priority names in the instance's configured order, highest first.
+    pub fn priorities(&self) -> Result<Vec<String>, String> {
+        Ok(parse_priorities(&self.get("/rest/api/2/priority", &[])?))
+    }
+
     /// The authenticated user — the target of "assign to me".
     pub fn myself(&self) -> Result<JiraUser, String> {
         let v = self.get("/rest/api/2/myself", &[])?;
@@ -287,6 +292,17 @@ fn parse_users(v: &Value) -> Vec<JiraUser> {
             a.iter()
                 .filter(|u| u["active"].as_bool() != Some(false))
                 .filter_map(parse_user)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `GET /priority` lists priorities in the order Jira ranks them.
+fn parse_priorities(v: &Value) -> Vec<String> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|p| p["name"].as_str().map(String::from))
                 .collect()
         })
         .unwrap_or_default()
@@ -422,6 +438,18 @@ mod tests {
             assignable_query("PROJ-7", "", true),
             vec![("issueKey", "PROJ-7"), ("maxResults", "50")]
         );
+    }
+
+    #[test]
+    fn priorities_keep_jira_order() {
+        let v = serde_json::json!([
+            {"id": "1", "name": "Highest"},
+            {"id": "10000", "name": "Blocker"},
+            {"id": "3", "name": "Medium"},
+            {"id": "x"}
+        ]);
+        assert_eq!(parse_priorities(&v), vec!["Highest", "Blocker", "Medium"]);
+        assert!(parse_priorities(&Value::Null).is_empty());
     }
 
     #[test]
