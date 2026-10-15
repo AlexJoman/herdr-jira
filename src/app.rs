@@ -271,10 +271,7 @@ impl App {
     }
 
     fn run_search(&mut self, query: String) {
-        let jql = self
-            .cfg
-            .expand_jql(&self.cfg.search.jql.clone())
-            .replace("{query}", &query.replace('"', "\\\""));
+        let jql = self.cfg.search_jql(&query);
         self.spawn_search(jql, format!("search: {query}"));
     }
 
@@ -1323,6 +1320,21 @@ mod tests {
 
     fn press(app: &mut App, code: KeyCode) {
         app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn slash_search_for_an_issue_key_queries_that_key() {
+        let (mut app, _rx) = assign_app();
+        press(&mut app, KeyCode::Char('/'));
+        for c in " proj-7 ".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.view, View::List);
+        assert_eq!(
+            app.last_jql,
+            r#"key = "PROJ-7" OR (text ~ "proj-7") ORDER BY updated DESC"#
+        );
     }
 
     #[test]

@@ -202,6 +202,21 @@ impl Config {
         template.replace("{project}", &self.jira.default_project)
     }
 
+    /// JQL for a `/` search. `text ~` does not cover the issue key, so a query
+    /// that looks like a key (e.g. `abc-123`) also matches that issue directly.
+    pub fn search_jql(&self, query: &str) -> String {
+        let jql = self
+            .expand_jql(&self.search.jql)
+            .replace("{query}", &query.replace('"', "\\\""));
+        if !is_issue_key(query) {
+            return jql;
+        }
+        // Keep the template's ORDER BY outside the OR.
+        let split = jql.to_ascii_uppercase().rfind(" ORDER BY ").unwrap_or(jql.len());
+        let (clause, order) = jql.split_at(split);
+        format!("key = \"{}\" OR ({}){}", query.to_ascii_uppercase(), clause.trim(), order)
+    }
+
     /// Resolve the API token: inline value wins, else run `api_token_cmd`.
     pub fn resolve_token(&self) -> Result<String, String> {
         let inline = self.jira.api_token.trim();
@@ -232,6 +247,15 @@ impl Config {
     }
 }
 
+/// Jira issue key: project key (letter, then letters/digits/_) + `-` + number.
+fn is_issue_key(s: &str) -> bool {
+    let Some((project, num)) = s.split_once('-') else { return false };
+    project.starts_with(|c: char| c.is_ascii_alphabetic())
+        && project.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !num.is_empty()
+        && num.chars().all(|c| c.is_ascii_digit())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,5 +276,39 @@ mod tests {
         // Old configs remain parseable even though this setting is ignored.
         assert_eq!(cfg.delegate.submit_delay_ms, 789);
         assert_eq!(cfg.delegate.agents.len(), 3);
+    }
+
+    fn search_cfg(template: &str) -> Config {
+        let mut cfg: Config = toml::from_str("[jira]\nbase_url = \"x\"\ndefault_project = \"PROJ\"\n").unwrap();
+        cfg.search.jql = template.into();
+        cfg
+    }
+
+    #[test]
+    fn issue_key_search_matches_the_key_not_only_text() {
+        // `text ~ "BUS-723"` returns nothing on Jira Cloud: the key is not a text field.
+        let cfg = search_cfg(r#"text ~ "{query}" ORDER BY updated DESC"#);
+        assert_eq!(
+            cfg.search_jql("bus-723"),
+            r#"key = "BUS-723" OR (text ~ "bus-723") ORDER BY updated DESC"#
+        );
+        let scoped = search_cfg(r#"project = {project} AND text ~ "{query}""#);
+        assert_eq!(
+            scoped.search_jql("PROJ_2-7"),
+            r#"key = "PROJ_2-7" OR (project = PROJ AND text ~ "PROJ_2-7")"#
+        );
+    }
+
+    #[test]
+    fn plain_text_search_is_unchanged() {
+        let cfg = search_cfg(r#"text ~ "{query}" ORDER BY updated DESC"#);
+        for q in ["login bug", "723", "re-open", "-12", "abc-", "1A-2", "say \"hi\""] {
+            let escaped = q.replace('"', "\\\"");
+            assert_eq!(
+                cfg.search_jql(q),
+                format!(r#"text ~ "{escaped}" ORDER BY updated DESC"#),
+                "{q}"
+            );
+        }
     }
 }
