@@ -360,8 +360,8 @@ impl App {
         self.request_priorities();
     }
 
-    /// Fetch the instance's priority order for sorting. On failure sorting
-    /// falls back to common priority names, so errors are not shown.
+    /// Fetch the instance's priority order for sorting. On failure
+    /// priorities sort alphabetically, so errors are not shown.
     fn request_priorities(&self) {
         let Some(client) = self.client.clone() else { return };
         let gen = self.client_gen;
