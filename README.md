@@ -28,8 +28,9 @@ template (issue key, summary, description, link, …).
 - **Columns** — key, type, status, priority, assignee, updated and summary.
 - **Sort** — `[`/`]` move the header cursor to a column, `S` sorts the list by
   it; press `S` again to reverse. The sorted column shows `▲`/`▼`. Priority
-  sorts in Jira's own priority order (Highest first when ascending, issues
-  without a priority last), not alphabetically; status sorts by category
+  sorts in the instance's own priority order (Highest first when ascending;
+  priorities it does not list follow alphabetically, issues without a priority
+  last); status sorts by category
   (to do → in progress → done). `U` returns to the order Jira sent. The sort
   is kept across filters and refreshes.
 - **Hide statuses** — `x` opens a picker of the statuses in the current list;

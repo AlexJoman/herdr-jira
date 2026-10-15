@@ -129,22 +129,17 @@ pub struct Sort {
     pub ascending: bool,
 }
 
-/// Common priority names, highest first — used for names the instance's own
-/// priority list (if it could be fetched) does not contain.
-const KNOWN_PRIORITIES: &[&str] = &[
-    "highest", "blocker", "critical", "high", "major", "medium", "normal", "low", "minor",
-    "lowest", "trivial",
-];
-
-/// Rank of `name` (0 = highest); `None` for no priority or an unknown name.
-fn priority_rank(order: &[String], name: &str) -> Option<usize> {
-    if let Some(i) = order.iter().position(|p| p.eq_ignore_ascii_case(name)) {
-        return Some(i);
+/// Sort key for a priority name: the instance's own rank (names it did not
+/// return rank after it, alphabetically); `None` for no priority.
+fn priority_key(order: &[String], name: &str) -> Option<(usize, String)> {
+    if name.is_empty() || name == "—" {
+        return None;
     }
-    KNOWN_PRIORITIES
+    let rank = order
         .iter()
         .position(|p| p.eq_ignore_ascii_case(name))
-        .map(|i| order.len() + i)
+        .unwrap_or(order.len());
+    Some((rank, name.to_lowercase()))
 }
 
 fn status_category_rank(category: &str) -> u8 {
@@ -164,19 +159,19 @@ fn key_parts(key: &str) -> (&str, u64) {
     }
 }
 
-/// Compare two issues on `sort`. Issues without a known priority stay last
+/// Compare two issues on `sort`. Issues without a priority stay last
 /// in either direction.
 fn compare_issues(a: &Issue, b: &Issue, sort: Sort, priorities: &[String]) -> Ordering {
     let ord = match sort.column {
         Column::Priority => {
             match (
-                priority_rank(priorities, &a.priority),
-                priority_rank(priorities, &b.priority),
+                priority_key(priorities, &a.priority),
+                priority_key(priorities, &b.priority),
             ) {
                 (Some(x), Some(y)) => x.cmp(&y),
                 (Some(_), None) => return Ordering::Less,
                 (None, Some(_)) => return Ordering::Greater,
-                (None, None) => a.priority.to_lowercase().cmp(&b.priority.to_lowercase()),
+                (None, None) => Ordering::Equal,
             }
         }
         Column::Key => key_parts(&a.key).cmp(&key_parts(&b.key)),
@@ -1315,11 +1310,7 @@ impl App {
                 self.picker_sel = Self::move_sel(len, self.picker_sel, -1)
             }
             KeyCode::Char(' ') | KeyCode::Enter => self.toggle_hidden_status(self.picker_sel),
-            KeyCode::Char('c') | KeyCode::Char('X') => {
-                let key = self.selected_issue().map(|i| i.key.clone());
-                self.hidden_statuses.clear();
-                self.reselect(key);
-            }
+            KeyCode::Char('c') | KeyCode::Char('X') => self.clear_status_filter(),
             _ => {}
         }
     }
@@ -1850,6 +1841,9 @@ mod tests {
     #[test]
     fn priority_sorts_by_jira_order_and_toggles() {
         let mut app = list_app();
+        app.priorities = ["Highest", "High", "Medium", "Low", "Lowest"]
+            .map(String::from)
+            .to_vec();
         sort_on(&mut app, Column::Priority);
         assert_eq!(
             app.sort,
@@ -1865,12 +1859,21 @@ mod tests {
     }
 
     #[test]
-    fn priority_order_from_jira_wins_over_known_names() {
+    fn priorities_missing_from_jira_order_sort_after_it_alphabetically() {
         let mut app = list_app();
         app.priorities = vec!["Low".into(), "Highest".into()];
         sort_on(&mut app, Column::Priority);
-        // Fetched order first, then the built-in names, then unknown.
+        // Fetched order first, then the rest alphabetically, then no priority.
         assert_eq!(keys(&app), vec!["P-2", "P-10", "P-4", "P-1", "P-3"]);
+    }
+
+    #[test]
+    fn priorities_sort_alphabetically_when_jira_order_is_unknown() {
+        let mut app = list_app();
+        sort_on(&mut app, Column::Priority);
+        assert_eq!(keys(&app), vec!["P-4", "P-10", "P-2", "P-1", "P-3"]);
+        press(&mut app, KeyCode::Char('S'));
+        assert_eq!(keys(&app), vec!["P-1", "P-2", "P-10", "P-4", "P-3"]);
     }
 
     #[test]
