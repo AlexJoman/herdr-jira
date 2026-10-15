@@ -26,8 +26,13 @@ api_token = ""
 # Default project key. Substituted for {project} in filters and search JQL.
 default_project = "PROJ"
 
-# Max issues fetched per filter/search.
-max_results = 50
+# Issues requested per page. Every page matching a filter/search is fetched
+# (Jira may return fewer per page than asked for; paging handles that).
+max_results = 100
+
+# Upper bound on issues loaded per filter/search, to stop runaway loads on
+# very broad JQL. The title shows "(cap N)" when it is hit. 0 = no limit.
+max_issues = 1000
 
 # --- Filters ---
 # Named JQL filters, switchable in the TUI with `f` (or keys 1-9).

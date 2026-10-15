@@ -30,8 +30,12 @@ pub struct JiraConfig {
     pub api_token_cmd: String,
     #[serde(default)]
     pub default_project: String,
+    /// Page size for issue searches; every page is fetched.
     #[serde(default = "default_max_results")]
     pub max_results: u32,
+    /// Upper bound on issues loaded per filter/search (0 = no limit).
+    #[serde(default = "default_max_issues")]
+    pub max_issues: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -119,7 +123,10 @@ fn default_auth() -> String {
     "basic".into()
 }
 fn default_max_results() -> u32 {
-    50
+    100
+}
+fn default_max_issues() -> u32 {
+    1000
 }
 fn default_search_jql() -> String {
     r#"text ~ "{query}" ORDER BY updated DESC"#.into()

@@ -25,6 +25,16 @@ template (issue key, summary, description, link, …).
 - **Epics** — epics stand out with a magenta type badge and a `▸` marker;
   `→` expands one inline to show its child issues (`parent = …`, with a
   `"Epic Link"` fallback for Server/DC), `←` collapses it.
+- **All matching issues** — every filter, search and epic expansion pages
+  through Jira's search API until all matches are loaded (`nextPageToken` on
+  Cloud's `/search/jql`, `startAt`/`total` on the classic `/search`). The first
+  page shows straight away; the title shows `⟳ loaded N of M…` (or `loaded N…`
+  where Jira does not report a total) while the rest arrive, and sort and the
+  status filter apply to the whole list as it grows. `[jira].max_results` sets
+  the page size (default 100). `[jira].max_issues` caps one load (default
+  1000, `0` = no limit) to stop runaway JQL; when the cap is hit the title
+  shows `first N … (max_issues)`. Switching filter, searching or refreshing
+  cancels a load that is still paging.
 - **Columns** — key, type, status, priority, assignee, updated and summary.
 - **Sort** — `[`/`]` move the header cursor to a column, `S` sorts the list by
   it; press `S` again to reverse. The sorted column shows `▲`/`▼`. Priority

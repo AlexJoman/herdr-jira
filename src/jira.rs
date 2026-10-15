@@ -48,7 +48,30 @@ pub struct JiraClient {
     base: String,
     auth_header: String,
     max_results: u32,
+    max_issues: usize,
     agent: ureq::Agent,
+}
+
+/// One page of search results.
+#[derive(Debug, Clone)]
+pub struct Page {
+    pub issues: Vec<Issue>,
+    /// Total matches, when the endpoint reports it (classic `/search` does;
+    /// Cloud's `/search/jql` does not).
+    pub total: Option<usize>,
+    /// No further pages follow: the results ran out or hit `max_issues`.
+    pub last: bool,
+    /// Loading stopped at `max_issues` with more matches left in Jira.
+    pub capped: bool,
+}
+
+/// Where the next search page starts. Cloud's `/search/jql` pages with an
+/// opaque `nextPageToken`; classic `/search` with a `startAt` offset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Cursor {
+    First,
+    Token(String),
+    StartAt(usize),
 }
 
 const FIELDS: &str = "summary,status,issuetype,priority,assignee,reporter,updated,labels,description";
@@ -74,6 +97,10 @@ impl JiraClient {
             base: cfg.jira.base_url.clone(),
             auth_header,
             max_results: cfg.jira.max_results.max(1),
+            max_issues: match cfg.jira.max_issues {
+                0 => usize::MAX,
+                n => n as usize,
+            },
             agent: ureq::AgentBuilder::new()
                 .timeout(std::time::Duration::from_secs(20))
                 .build(),
@@ -127,29 +154,67 @@ impl JiraClient {
         }
     }
 
+    /// Every issue matching `jql` (up to the `max_issues` cap), all pages.
     pub fn search(&self, jql: &str) -> Result<Vec<Issue>, String> {
-        let max = self.max_results.to_string();
-        let query: &[(&str, &str)] = &[
-            ("jql", jql),
-            ("maxResults", &max),
-            ("fields", FIELDS),
-        ];
-        // New endpoint first (Jira Cloud), classic /search as fallback (Server/DC).
-        let result = match self.get("/rest/api/2/search/jql", query) {
-            Ok(v) => Ok(v),
-            Err(e) if e.starts_with("HTTP 404") || e.starts_with("HTTP 405") || e.starts_with("HTTP 410") => {
-                self.get("/rest/api/2/search", query)
+        let mut all = Vec::new();
+        self.search_pages(jql, |page| {
+            all.extend(page.issues);
+            true
+        })?;
+        Ok(all)
+    }
+
+    /// Page through every issue matching `jql`, handing each page to
+    /// `on_page` as it arrives; `on_page` returns `false` to stop early.
+    /// An error on the first page means nothing was delivered.
+    pub fn search_pages(
+        &self,
+        jql: &str,
+        mut on_page: impl FnMut(Page) -> bool,
+    ) -> Result<(), String> {
+        let page_size = self.max_results.to_string();
+        // New endpoint first (Jira Cloud), classic /search as fallback
+        // (Server/DC); the choice made on the first page sticks.
+        let mut classic = false;
+        let fetch = |cursor: &Cursor| {
+            let mut query: Vec<(&str, &str)> = vec![
+                ("jql", jql),
+                ("maxResults", &page_size),
+                ("fields", FIELDS),
+            ];
+            let start;
+            match cursor {
+                Cursor::First => {}
+                Cursor::Token(t) => query.push(("nextPageToken", t)),
+                Cursor::StartAt(n) => {
+                    start = n.to_string();
+                    query.push(("startAt", &start));
+                }
             }
-            Err(e) => Err(e),
-        }?;
-        let issues = result["issues"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .iter()
-            .map(|v| self.parse_issue(v))
-            .collect();
-        Ok(issues)
+            if !classic {
+                match self.get("/rest/api/2/search/jql", &query) {
+                    Err(e)
+                        if matches!(cursor, Cursor::First)
+                            && (e.starts_with("HTTP 404")
+                                || e.starts_with("HTTP 405")
+                                || e.starts_with("HTTP 410")) =>
+                    {
+                        classic = true;
+                    }
+                    other => return other,
+                }
+            }
+            self.get("/rest/api/2/search", &query)
+        };
+        paginate(self.max_issues, fetch, |raw, total, last, capped| {
+            let issues = raw.iter().map(|v| self.parse_issue(v)).collect();
+            on_page(Page {
+                issues,
+                total,
+                last,
+                capped,
+            })
+        })
     }
 
     fn parse_issue(&self, v: &Value) -> Issue {
@@ -247,6 +312,51 @@ impl JiraClient {
             assignee_body(user, cloud),
         )?;
         Ok(())
+    }
+}
+
+/// Drive a paged search: `fetch` gets one page per cursor and `on_page`
+/// receives each page's raw issues with the reported total, whether it is
+/// the last page, and whether that is because `limit` cut it short. Stops when the results run out, `limit` issues have been
+/// delivered, or `on_page` returns `false`. Handles both paging contracts:
+/// `nextPageToken`/`isLast` (`/search/jql`) and `startAt`/`total` (`/search`).
+fn paginate(
+    limit: usize,
+    mut fetch: impl FnMut(&Cursor) -> Result<Value, String>,
+    mut on_page: impl FnMut(Vec<Value>, Option<usize>, bool, bool) -> bool,
+) -> Result<(), String> {
+    let mut cursor = Cursor::First;
+    let mut delivered = 0usize;
+    loop {
+        let v = fetch(&cursor)?;
+        let mut raw = v["issues"].as_array().cloned().unwrap_or_default();
+        let got = raw.len();
+        let total = v["total"].as_u64().map(|t| t as usize);
+        let next = match (v["nextPageToken"].as_str(), &cursor) {
+            // A token that repeats would loop forever; treat it as the end.
+            (Some(t), Cursor::Token(prev)) if t == prev => None,
+            (Some(_), _) if v["isLast"].as_bool() == Some(true) => None,
+            (Some(t), _) if !t.is_empty() && got > 0 => Some(Cursor::Token(t.to_string())),
+            (Some(_), _) => None,
+            (None, _) => {
+                let start = match cursor {
+                    Cursor::StartAt(n) => n,
+                    _ => v["startAt"].as_u64().unwrap_or(0) as usize,
+                };
+                match total {
+                    Some(t) if got > 0 && start + got < t => Some(Cursor::StartAt(start + got)),
+                    _ => None,
+                }
+            }
+        };
+        raw.truncate(limit - delivered);
+        delivered += raw.len();
+        let capped = delivered >= limit && (got > raw.len() || next.is_some());
+        let last = next.is_none() || delivered >= limit;
+        if !on_page(raw, total, last, capped) || last {
+            return Ok(());
+        }
+        cursor = next.expect("not last");
     }
 }
 
@@ -450,6 +560,163 @@ mod tests {
         ]);
         assert_eq!(parse_priorities(&v), vec!["Highest", "Blocker", "Medium"]);
         assert!(parse_priorities(&Value::Null).is_empty());
+    }
+
+    fn raw_issues(keys: std::ops::Range<usize>) -> Vec<Value> {
+        keys.map(|n| serde_json::json!({ "key": format!("P-{n}") })).collect()
+    }
+
+    /// Run `paginate` over canned responses; returns the cursors requested
+    /// and the (keys, total, last, capped) of every delivered page.
+    fn run_pages(
+        limit: usize,
+        responses: Vec<Value>,
+        stop_after: usize,
+    ) -> (Vec<Cursor>, Vec<(Vec<String>, Option<usize>, bool, bool)>) {
+        let mut responses = responses.into_iter();
+        let mut cursors = vec![];
+        let mut pages = vec![];
+        paginate(
+            limit,
+            |c| {
+                cursors.push(c.clone());
+                responses.next().ok_or_else(|| "no more responses".to_string())
+            },
+            |raw, total, last, capped| {
+                let keys = raw.iter().map(|v| v["key"].as_str().unwrap().to_string()).collect();
+                pages.push((keys, total, last, capped));
+                pages.len() < stop_after
+            },
+        )
+        .unwrap();
+        (cursors, pages)
+    }
+
+    #[test]
+    fn paginate_follows_next_page_token_until_is_last() {
+        let (cursors, pages) = run_pages(
+            1000,
+            vec![
+                serde_json::json!({ "issues": raw_issues(0..2), "nextPageToken": "a" }),
+                serde_json::json!({ "issues": raw_issues(2..4), "nextPageToken": "b", "isLast": false }),
+                serde_json::json!({ "issues": raw_issues(4..5), "isLast": true }),
+            ],
+            usize::MAX,
+        );
+        assert_eq!(
+            cursors,
+            vec![Cursor::First, Cursor::Token("a".into()), Cursor::Token("b".into())]
+        );
+        let keys: Vec<String> = pages.iter().flat_map(|p| p.0.clone()).collect();
+        assert_eq!(keys, ["P-0", "P-1", "P-2", "P-3", "P-4"]);
+        assert_eq!(
+            pages.iter().map(|p| (p.1, p.2, p.3)).collect::<Vec<_>>(),
+            vec![(None, false, false), (None, false, false), (None, true, false)]
+        );
+    }
+
+    #[test]
+    fn paginate_follows_start_at_until_total() {
+        let (cursors, pages) = run_pages(
+            1000,
+            vec![
+                serde_json::json!({ "startAt": 0, "total": 5, "issues": raw_issues(0..2) }),
+                serde_json::json!({ "startAt": 2, "total": 5, "issues": raw_issues(2..4) }),
+                serde_json::json!({ "startAt": 4, "total": 5, "issues": raw_issues(4..5) }),
+            ],
+            usize::MAX,
+        );
+        assert_eq!(
+            cursors,
+            vec![Cursor::First, Cursor::StartAt(2), Cursor::StartAt(4)]
+        );
+        assert_eq!(pages.len(), 3);
+        assert!(pages.iter().all(|p| p.1 == Some(5)));
+        assert_eq!(pages.iter().map(|p| p.2).collect::<Vec<_>>(), [false, false, true]);
+    }
+
+    #[test]
+    fn paginate_single_page_needs_one_request() {
+        let (cursors, pages) = run_pages(
+            1000,
+            vec![serde_json::json!({ "startAt": 0, "total": 2, "issues": raw_issues(0..2) })],
+            usize::MAX,
+        );
+        assert_eq!(cursors, vec![Cursor::First]);
+        assert_eq!(pages, vec![(vec!["P-0".into(), "P-1".into()], Some(2), true, false)]);
+    }
+
+    #[test]
+    fn paginate_stops_at_the_issue_cap() {
+        let (cursors, pages) = run_pages(
+            3,
+            vec![
+                serde_json::json!({ "issues": raw_issues(0..2), "nextPageToken": "a" }),
+                serde_json::json!({ "issues": raw_issues(2..4), "nextPageToken": "b" }),
+            ],
+            usize::MAX,
+        );
+        assert_eq!(cursors.len(), 2);
+        assert_eq!(pages[1], (vec!["P-2".into()], None, true, true));
+        // Hitting the cap exactly at the end of the results is not "capped".
+        let (_, pages) = run_pages(
+            2,
+            vec![serde_json::json!({ "startAt": 0, "total": 2, "issues": raw_issues(0..2) })],
+            usize::MAX,
+        );
+        assert_eq!(pages[0].3, false);
+    }
+
+    #[test]
+    fn paginate_stops_when_the_caller_cancels() {
+        let (cursors, pages) = run_pages(
+            1000,
+            vec![
+                serde_json::json!({ "issues": raw_issues(0..2), "nextPageToken": "a" }),
+                serde_json::json!({ "issues": raw_issues(2..4), "nextPageToken": "b" }),
+            ],
+            1,
+        );
+        assert_eq!(cursors, vec![Cursor::First]);
+        assert_eq!(pages.len(), 1);
+        assert!(!pages[0].2, "cancelled, not exhausted");
+    }
+
+    #[test]
+    fn paginate_never_loops_on_a_stuck_cursor() {
+        // A repeated token, or a page with no issues, ends the search.
+        let (cursors, _) = run_pages(
+            1000,
+            vec![
+                serde_json::json!({ "issues": raw_issues(0..2), "nextPageToken": "a" }),
+                serde_json::json!({ "issues": raw_issues(2..4), "nextPageToken": "a" }),
+            ],
+            usize::MAX,
+        );
+        assert_eq!(cursors.len(), 2);
+        let (cursors, _) = run_pages(
+            1000,
+            vec![serde_json::json!({ "startAt": 0, "total": 9, "issues": [] })],
+            usize::MAX,
+        );
+        assert_eq!(cursors.len(), 1);
+    }
+
+    #[test]
+    fn paginate_reports_a_failed_page() {
+        let mut calls = 0;
+        let result = paginate(
+            1000,
+            |_| {
+                calls += 1;
+                match calls {
+                    1 => Ok(serde_json::json!({ "issues": raw_issues(0..1), "nextPageToken": "a" })),
+                    _ => Err("HTTP 500: boom".to_string()),
+                }
+            },
+            |_, _, _, _| true,
+        );
+        assert_eq!(result, Err("HTTP 500: boom".into()));
     }
 
     #[test]
