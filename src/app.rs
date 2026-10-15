@@ -3,11 +3,12 @@
 
 use crate::config::{Config, SpawnAgent};
 use crate::herdr::{self, HerdrAgent, HerdrWorkspace, StartAgentOpts};
-use crate::jira::{Issue, JiraClient, JiraUser, Transition};
+use crate::jira::{Issue, JiraClient, JiraUser, Page, Transition};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -37,9 +38,11 @@ pub enum View {
 }
 
 pub enum Resp {
+    /// One page of the issue search started as generation `gen`.
     Issues {
+        gen: u64,
         title: String,
-        result: Result<Vec<Issue>, String>,
+        result: Result<Page, String>,
     },
     Transitions {
         key: String,
@@ -207,6 +210,15 @@ pub struct App {
     pub selected: usize,
     pub current_title: String,
     pub loading: bool,
+    /// Generation of the current issue search. Starting a new search bumps
+    /// it, which stops the previous one paging and discards its late pages.
+    pub search_gen: Arc<AtomicU64>,
+    /// Pages of the current search received so far.
+    pub pages_loaded: usize,
+    /// Total matches as reported by Jira (classic `/search` only).
+    pub search_total: Option<usize>,
+    /// Loading stopped at `[jira].max_issues` with more matches left.
+    pub search_capped: bool,
     pub fatal: Option<String>, // config/auth error shown full-screen
 
     pub filter_idx: usize,
@@ -279,7 +291,8 @@ impl App {
                     api_token: String::new(),
                     api_token_cmd: String::new(),
                     default_project: String::new(),
-                    max_results: 50,
+                    max_results: 100,
+                    max_issues: 0,
                 },
                 filters: vec![],
                 search: Default::default(),
@@ -296,6 +309,10 @@ impl App {
             selected: 0,
             current_title: String::new(),
             loading: false,
+            search_gen: Arc::new(AtomicU64::new(0)),
+            pages_loaded: 0,
+            search_total: None,
+            search_capped: false,
             fatal: None,
             filter_idx: 0,
             picker_sel: 0,
@@ -490,10 +507,42 @@ impl App {
         self.last_jql = jql.clone();
         self.last_fallback_jql = fallback.clone();
         self.loading = true;
+        self.pages_loaded = 0;
+        let gen = self.search_gen.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+        let current = self.search_gen.clone();
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let result = search_with_fallback(|q| client.search(q), &jql, fallback.as_deref());
-            let _ = tx.send(Resp::Issues { title, result });
+            let mut delivered = false;
+            let result = search_with_fallback(
+                |q| {
+                    client
+                        .search_pages(q, |page| {
+                            delivered = true;
+                            let _ = tx.send(Resp::Issues {
+                                gen,
+                                title: title.clone(),
+                                result: Ok(page),
+                            });
+                            // Keep paging only while this is still the current search.
+                            current.load(AtomicOrdering::SeqCst) == gen
+                        })
+                        // A later page failing must not re-run the search with
+                        // the fallback JQL on top of the pages already shown.
+                        .map_err(|e| match delivered {
+                            true => format!("loading more issues: {e}"),
+                            false => e,
+                        })
+                },
+                &jql,
+                fallback.as_deref(),
+            );
+            if let Err(e) = result {
+                let _ = tx.send(Resp::Issues {
+                    gen,
+                    title,
+                    result: Err(e),
+                });
+            }
         });
     }
 
@@ -895,20 +944,32 @@ impl App {
 
     pub fn on_resp(&mut self, resp: Resp) {
         match resp {
-            Resp::Issues { title, result } => {
-                self.loading = false;
-                match result {
-                    Ok(issues) => {
+            Resp::Issues { gen, .. } if gen != self.search_gen.load(AtomicOrdering::SeqCst) => {}
+            Resp::Issues { title, result, .. } => match result {
+                Ok(page) => {
+                    self.loading = !page.last;
+                    self.search_total = page.total;
+                    self.search_capped = page.capped;
+                    if self.pages_loaded == 0 {
                         self.current_title = title;
-                        self.issues = issues;
+                        self.issues = page.issues;
                         self.children.clear();
                         self.expanded.clear();
                         self.loading_children.clear();
                         self.selected = self.selected.min(self.visible().len().saturating_sub(1));
+                    } else {
+                        // Later pages may sort in above the cursor; stay on the same issue.
+                        let key = self.selected_issue().map(|i| i.key.clone());
+                        self.issues.extend(page.issues);
+                        self.reselect(key);
                     }
-                    Err(e) => self.toast(format!("Jira: {e}"), true),
+                    self.pages_loaded += 1;
                 }
-            }
+                Err(e) => {
+                    self.loading = false;
+                    self.toast(format!("Jira: {e}"), true);
+                }
+            },
             Resp::Transitions { key, result } => {
                 if key != self.transitions_for {
                     return;
@@ -1520,7 +1581,7 @@ impl App {
 /// Jira Server/DC rejects `key = "X-1"` with HTTP 400 when the key does not
 /// exist; retry such a search once with `fallback`.
 fn search_with_fallback<T>(
-    search: impl Fn(&str) -> Result<T, String>,
+    mut search: impl FnMut(&str) -> Result<T, String>,
     jql: &str,
     fallback: Option<&str>,
 ) -> Result<T, String> {
@@ -1823,6 +1884,127 @@ mod tests {
         app
     }
 
+    fn page(issues: Vec<Issue>, last: bool) -> Page {
+        Page {
+            issues,
+            total: Some(5),
+            last,
+            capped: false,
+        }
+    }
+
+    /// Start a search on `assign_app`'s dead-port client; its own (failing)
+    /// response is left in the channel, so tests feed pages by hand.
+    fn search_app() -> (App, std::sync::mpsc::Receiver<Resp>, u64) {
+        let (mut app, rx) = assign_app();
+        app.spawn_search("project = P".into(), None, "P".into());
+        let gen = app.search_gen.load(AtomicOrdering::SeqCst);
+        (app, rx, gen)
+    }
+
+    #[test]
+    fn search_pages_replace_then_append_until_the_last() {
+        let (mut app, _rx, gen) = search_app();
+        assert!(app.loading);
+        app.on_resp(Resp::Issues {
+            gen,
+            title: "P".into(),
+            result: Ok(page(vec![issue("P-2", "Done", "Low"), issue("P-10", "To Do", "Highest")], false)),
+        });
+        assert_eq!(keys(&app), vec!["P-2", "P-10"], "first page replaces the old list");
+        assert!(app.loading, "more pages to come");
+        assert_eq!((app.pages_loaded, app.search_total), (1, Some(5)));
+        app.on_resp(Resp::Issues {
+            gen,
+            title: "P".into(),
+            result: Ok(page(
+                vec![
+                    issue("P-3", "In Progress", "—"),
+                    issue("P-1", "To Do", "Medium"),
+                    issue("P-4", "Done", "High"),
+                ],
+                true,
+            )),
+        });
+        assert_eq!(keys(&app), vec!["P-2", "P-10", "P-3", "P-1", "P-4"]);
+        assert!(!app.loading);
+        assert_eq!(app.current_title, "P");
+    }
+
+    #[test]
+    fn sort_and_status_filter_cover_later_pages_and_keep_selection() {
+        let (mut app, _rx, gen) = search_app();
+        app.on_resp(Resp::Issues {
+            gen,
+            title: "P".into(),
+            result: Ok(page(vec![issue("P-2", "Done", "Low"), issue("P-10", "To Do", "Highest")], false)),
+        });
+        sort_on(&mut app, Column::Key);
+        app.hidden_statuses.insert("Done".into());
+        app.reselect(None);
+        assert_eq!(app.selected_issue().unwrap().key, "P-10");
+        app.on_resp(Resp::Issues {
+            gen,
+            title: "P".into(),
+            result: Ok(page(
+                vec![
+                    issue("P-3", "In Progress", "—"),
+                    issue("P-1", "To Do", "Medium"),
+                    issue("P-4", "Done", "High"),
+                ],
+                true,
+            )),
+        });
+        assert_eq!(keys(&app), vec!["P-1", "P-3", "P-10"]);
+        assert_eq!(app.selected_issue().unwrap().key, "P-10", "cursor follows the issue");
+        assert_eq!(app.hidden_count(), 2);
+    }
+
+    #[test]
+    fn a_new_search_discards_pages_of_the_old_one() {
+        let (mut app, _rx, old) = search_app();
+        app.spawn_search("project = Q".into(), None, "Q".into());
+        let gen = app.search_gen.load(AtomicOrdering::SeqCst);
+        assert_ne!(gen, old);
+        app.on_resp(Resp::Issues {
+            gen: old,
+            title: "P".into(),
+            result: Ok(page(vec![issue("P-1", "To Do", "Low")], true)),
+        });
+        assert!(app.loading, "stale last page does not end the new load");
+        assert_eq!(keys(&app), vec!["PROJ-7"]);
+        app.on_resp(Resp::Issues {
+            gen: old,
+            title: "P".into(),
+            result: Err("HTTP 500: stale".into()),
+        });
+        assert!(app.toast.is_none());
+        app.on_resp(Resp::Issues {
+            gen,
+            title: "Q".into(),
+            result: Ok(page(vec![issue("Q-1", "To Do", "Low")], true)),
+        });
+        assert_eq!((keys(&app), app.current_title.as_str()), (vec!["Q-1"], "Q"));
+    }
+
+    #[test]
+    fn a_failed_page_keeps_loaded_issues_and_stops_loading() {
+        let (mut app, _rx, gen) = search_app();
+        app.on_resp(Resp::Issues {
+            gen,
+            title: "P".into(),
+            result: Ok(page(vec![issue("P-1", "To Do", "Low")], false)),
+        });
+        app.on_resp(Resp::Issues {
+            gen,
+            title: "P".into(),
+            result: Err("loading more issues: HTTP 500: boom".into()),
+        });
+        assert!(!app.loading);
+        assert_eq!(keys(&app), vec!["P-1"]);
+        assert!(app.toast.as_ref().unwrap().1, "shown as an error");
+    }
+
     fn keys(app: &App) -> Vec<&str> {
         app.visible().iter().map(|(i, _)| i.key.as_str()).collect()
     }
@@ -1918,8 +2100,12 @@ mod tests {
 
         // The filter survives a reload and still lists hidden statuses.
         app.on_resp(Resp::Issues {
+            gen: app.search_gen.load(AtomicOrdering::SeqCst),
             title: "again".into(),
-            result: Ok(vec![issue("P-5", "Done", "Low"), issue("P-6", "To Do", "Low")]),
+            result: Ok(page(
+                vec![issue("P-5", "Done", "Low"), issue("P-6", "To Do", "Low")],
+                true,
+            )),
         });
         assert_eq!(keys(&app), vec!["P-6"]);
         press(&mut app, KeyCode::Char('x'));

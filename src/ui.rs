@@ -94,7 +94,21 @@ fn draw_list(f: &mut Frame, app: &App, area: Rect) {
         ));
     }
     if app.loading {
-        title_spans.push(Span::styled("  ⟳ loading…", Style::new().fg(Color::Yellow)));
+        let progress = match (app.pages_loaded, app.search_total) {
+            (0, _) => "  ⟳ loading…".to_string(),
+            (_, Some(total)) => format!("  ⟳ loaded {} of {total}…", app.issues.len()),
+            (_, None) => format!("  ⟳ loaded {}…", app.issues.len()),
+        };
+        title_spans.push(Span::styled(progress, Style::new().fg(Color::Yellow)));
+    } else if app.search_capped {
+        let more = match app.search_total {
+            Some(total) => format!(" of {total}"),
+            None => String::new(),
+        };
+        title_spans.push(Span::styled(
+            format!(" first {}{more} (max_issues) ", app.issues.len()),
+            Style::new().fg(Color::Black).bg(Color::Yellow),
+        ));
     }
     let block = Block::default()
         .borders(Borders::ALL)
