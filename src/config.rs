@@ -205,9 +205,7 @@ impl Config {
     /// JQL for a `/` search. `text ~` does not cover the issue key, so a query
     /// that looks like a key (e.g. `abc-123`) also matches that issue directly.
     pub fn search_jql(&self, query: &str) -> String {
-        let jql = self
-            .expand_jql(&self.search.jql)
-            .replace("{query}", &query.replace('"', "\\\""));
+        let jql = self.text_search_jql(query);
         if !is_issue_key(query) {
             return jql;
         }
@@ -215,6 +213,12 @@ impl Config {
         let split = jql.to_ascii_uppercase().rfind(" ORDER BY ").unwrap_or(jql.len());
         let (clause, order) = jql.split_at(split);
         format!("key = \"{}\" OR ({}){}", query.to_ascii_uppercase(), clause.trim(), order)
+    }
+
+    /// The configured text-search JQL for `query`, without the issue-key clause.
+    pub fn text_search_jql(&self, query: &str) -> String {
+        self.expand_jql(&self.search.jql)
+            .replace("{query}", &query.replace('"', "\\\""))
     }
 
     /// Resolve the API token: inline value wins, else run `api_token_cmd`.
